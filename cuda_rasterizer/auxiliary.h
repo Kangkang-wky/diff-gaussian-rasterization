@@ -16,6 +16,7 @@
 #include "stdio.h"
 
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
+#define WARPSIZE 32
 #define NUM_WARPS (BLOCK_SIZE/32)
 
 // Spherical harmonics coefficients

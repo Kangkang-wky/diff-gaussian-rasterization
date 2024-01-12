@@ -17,7 +17,7 @@ namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
-__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
+__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs_feature_dc, const float* shs_feature_rest, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs_feature_dc, glm::vec3* dL_dshs_feature_rest)
 {
 	// Compute intermediate values, as it is done during forward
 	glm::vec3 pos = means[idx];
@@ -460,7 +460,7 @@ renderCUDA(
 
 	__shared__ float collected_dL_dcolors[C * BLOCK_SIZE];
 	__shared__ float4 collected_dL_dconic2D[BLOCK_SIZE];
-	__shared__ float2 colleted_dL_dmeans2D[BLOCK_SIZE];
+	__shared__ float2 collected_dL_dmeans2D[BLOCK_SIZE];
 	__shared__ float collected_dL_dopacity[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
@@ -488,6 +488,7 @@ renderCUDA(
 	const float ddely_dy = 0.5 * H;
 
 	const int lane_id = block.thread_rank() & (WARPSIZE - 1);
+	const int warp_id = (block.thread_rank() >> 5);
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -495,6 +496,7 @@ renderCUDA(
 		// and load them in revers order.
 		block.sync();
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		// 注意这里可能是没有 256 个高斯球的，这里 collected 部分有一部分乱值
 		if (range.x + progress < range.y)
 		{
 			const int coll_id = point_list[range.y - progress - 1];
@@ -503,106 +505,155 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
-			for (int ch = 0; ch < C; ch++) {
-				collected_dL_dcolors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
-			}
-			
-			collected_dL_dconic2D[block.thread_rank()].x = 0.0f;
-			collected_dL_dconic2D[block.thread_rank()].y = 0.0f;
-			collected_dL_dconic2D[block.thread_rank()].w = 0.0f;
-			
-			colleted_dL_dmeans2D[block.thread_rank()] = float2{0.0f, 0.0f};
-
-			collected_dL_dopacity[block.thread_rank()] = 0.0f;
 		}
 		block.sync();
 
 		// Iterate over Gaussians
-		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++)
+		// shuffle 值初始化
+		float shuffle_dmean2D_x = 0.0f;
+		float shuffle_dmean2D_y = 0.0f;
+		float shuffle_dconic2D_x = 0.0f;
+		float shuffle_dconic2D_y = 0.0f;
+		float shuffle_dconic2D_w = 0.0f;
+		float shuffle_dopacity = 0.0f;
+		float shuffle_dcolor_x = 0.0f;
+		float shuffle_dcolor_y = 0.0f;
+		float shuffle_dcolor_z = 0.0f;
+		bool flag = true;		
+
+		// 内部循环 toDo 的 高斯球
+		int inner_toDo = toDo;
+		// 内部需要处理的高斯球的总数, 要么是 256 个, 要么是 inner 个
+		const int max_gaussian_inner = min(BLOCK_SIZE, inner_toDo);
+	
+		// loops 内循环次数, 内循环被拆分成 32 个高斯球
+		const int inner_rounds = (max_gaussian_inner + 32 - 1) / 32;
+
+		for (int loops = 0; loops < inner_rounds; loops++, inner_toDo -= 32) {
+
+		block.sync();
+
+		// shared memory dL 更新值
+		for (int ch = 0; ch < C; ch++) {
+			collected_dL_dcolors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+		}
+		
+		collected_dL_dconic2D[block.thread_rank()].x = 0.0f;
+		collected_dL_dconic2D[block.thread_rank()].y = 0.0f;
+		collected_dL_dconic2D[block.thread_rank()].w = 0.0f;
+		
+		collected_dL_dmeans2D[block.thread_rank()] = float2{0.0f, 0.0f};
+
+		collected_dL_dopacity[block.thread_rank()] = 0.0f;
+		// shared memory 更新完毕
+
+		block.sync();
+
+		// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
+		for (int j = 0; j < min(32, inner_toDo); j++)
 		{
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
+			float2 xy;
+			float2 d;
+			float4 con_o;
+			float power;
+			float G;
+			float alpha;
+			float dchannel_dcolor;
+			float dL_dalpha;
+
+			float bg_dot_dpixel;   
+			float dL_dchannel;     
+			float c;           
+
+			float dL_dG;         
+			float gdx;
+			float gdy;
+			float dG_ddelx;
+			float dG_ddely;                                                                                                                                                                                         
+
+			shuffle_dmean2D_x = 0.0f;
+			shuffle_dmean2D_y = 0.0f;
+			shuffle_dconic2D_x = 0.0f;
+			shuffle_dconic2D_y = 0.0f;
+			shuffle_dconic2D_w = 0.0f;
+			shuffle_dopacity = 0.0f;
+			shuffle_dcolor_x = 0.0f;
+			shuffle_dcolor_y = 0.0f;
+			shuffle_dcolor_z = 0.0f;
+			flag = false;
+			
 			if (!done) {
 				contributor--;
-			}
-			// Compute blending values, as before.
-			const float2 xy = collected_xy[j];
-			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			const float4 con_o = collected_conic_opacity[j];
-			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+				if (contributor < last_contributor) {
+					// Compute blending values, as before.
+					xy = collected_xy[loops * 32 + j];
+					d = { xy.x - pixf.x, xy.y - pixf.y };
+					con_o = collected_conic_opacity[loops * 32 + j];
+					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+					if (power <= 0.0f) {
+						G = exp(power);
+						alpha = min(ALPHA_LIMIT, con_o.w * G);
+						if (alpha >= ALPHA_THRESHOLD) {
+							flag = true;
+			
+							T = T / (1.f - alpha);
+							dchannel_dcolor = alpha * T;
 
-			const float G = expf(power);
-			const float alpha = min(ALPHA_LIMIT, con_o.w * G);
+							// Propagate gradients to per-Gaussian colors and keep
+							// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+							// pair).
+							dL_dalpha = 0.0f;
+							// const int global_id = collected_id[j];
+							for (int ch = 0; ch < C; ch++)
+							{
+								c = collected_colors[ch * BLOCK_SIZE + loops * 32 + j];
+								// Update last color (to be used in the next iteration)
+								accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+								last_color[ch] = c;
 
-			float shuffle_dmean2D_x = 0.0f;
-			float shuffle_dmean2D_y = 0.0f;
-			float shuffle_dconic2D_x = 0.0f;
-			float shuffle_dconic2D_y = 0.0f;
-			float shuffle_dconic2D_w = 0.0f;
-			float shuffle_dopacity = 0.0f;
-			float shuffle_dcolor_x = 0.0f;
-			float shuffle_dcolor_y = 0.0f;
-			float shuffle_dcolor_z = 0.0f;
-			bool flag = true;
+								dL_dchannel = dL_dpixel[ch];
+								dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+								// Update the gradients w.r.t. color of the Gaussian. 
+								// Atomic, since this pixel is just one of potentially
+								// many that were affected by this Gaussian.
+								if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
+								else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
+								else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
+								// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+							}
+							dL_dalpha *= T;
+							// Update last alpha (to be used in the next iteration)
+							last_alpha = alpha;
 
-			if (done == true || contributor >= last_contributor || power > 0.0f || alpha < ALPHA_THRESHOLD) {
-				flag = false;
-			}
-			else {
-				T = T / (1.f - alpha);
-				const float dchannel_dcolor = alpha * T;
+							// Account for fact that alpha also influences how much of
+							// the background color is added if nothing left to blend
+							bg_dot_dpixel = 0;
+							for (int i = 0; i < C; i++)
+								bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+							dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
-				// Propagate gradients to per-Gaussian colors and keep
-				// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-				// pair).
-				float dL_dalpha = 0.0f;
-				// const int global_id = collected_id[j];
-				for (int ch = 0; ch < C; ch++)
-				{
-					const float c = collected_colors[ch * BLOCK_SIZE + j];
-					// Update last color (to be used in the next iteration)
-					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-					last_color[ch] = c;
 
-					const float dL_dchannel = dL_dpixel[ch];
-					dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-					// Update the gradients w.r.t. color of the Gaussian. 
-					// Atomic, since this pixel is just one of potentially
-					// many that were affected by this Gaussian.
-					if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
-					else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
-					else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
+							// Helpful reusable temporary variables
+							dL_dG = con_o.w * dL_dalpha;
+							gdx = G * d.x;
+							gdy = G * d.y;
+							dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+							dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+							shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
+							shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
+							shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
+							shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
+							shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
+							shuffle_dopacity = G * dL_dalpha;
+						}
+					}
 				}
-				dL_dalpha *= T;
-				// Update last alpha (to be used in the next iteration)
-				last_alpha = alpha;
-
-				// Account for fact that alpha also influences how much of
-				// the background color is added if nothing left to blend
-				float bg_dot_dpixel = 0;
-				for (int i = 0; i < C; i++)
-					bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-				dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
-
-
-				// Helpful reusable temporary variables
-				const float dL_dG = con_o.w * dL_dalpha;
-				const float gdx = G * d.x;
-				const float gdy = G * d.y;
-				const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-				const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
-
-				shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
-				shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
-				shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
-				shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
-				shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
-				shuffle_dopacity = G * dL_dalpha;
-
 			}
-
-			unsigned active = __activemask();
-			if (__any_sync(active, flag == true)) {
+			// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
+			if (__any_sync(0xffffffff, flag == true)) {
 				shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
 				shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
 				shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
@@ -616,43 +667,72 @@ renderCUDA(
 
 				shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
 
+				const int idx = j * 8 + warp_id;
+				// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
 				if (lane_id == 0) {
-					atomicAdd(&(collected_dL_dcolors[j * C + 0]), shuffle_dcolor_x);
-					atomicAdd(&(collected_dL_dcolors[j * C + 1]), shuffle_dcolor_y);
-					atomicAdd(&(collected_dL_dcolors[j * C + 2]), shuffle_dcolor_z);
 
-					// Update gradients w.r.t. 2D mean position of the Gaussian
-					atomicAdd(&colleted_dL_dmeans2D[j].x, shuffle_dmean2D_x);
-					atomicAdd(&colleted_dL_dmeans2D[j].y, shuffle_dmean2D_y);
+					collected_dL_dcolors[idx * C + 0] = shuffle_dcolor_x;
+					collected_dL_dcolors[idx * C + 1] = shuffle_dcolor_y;
+					collected_dL_dcolors[idx * C + 2] = shuffle_dcolor_z;
 
-					// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-					atomicAdd(&collected_dL_dconic2D[j].x, shuffle_dconic2D_x);
-					atomicAdd(&collected_dL_dconic2D[j].y, shuffle_dconic2D_y);
-					atomicAdd(&collected_dL_dconic2D[j].w, shuffle_dconic2D_w);
+					collected_dL_dmeans2D[idx].x = shuffle_dmean2D_x;
+					collected_dL_dmeans2D[idx].y = shuffle_dmean2D_y;
 
-					// Update gradients w.r.t. opacity of the Gaussian
-					atomicAdd(&(collected_dL_dopacity[j]), shuffle_dopacity);
+					collected_dL_dconic2D[idx].x = shuffle_dconic2D_x;
+					collected_dL_dconic2D[idx].y = shuffle_dconic2D_y;
+					collected_dL_dconic2D[idx].w = shuffle_dconic2D_w;
+	
+					collected_dL_dopacity[idx] = shuffle_dopacity;
 				}
 			}
 		}
+
+		// shared 上同步 32 个高斯球的梯度已经完成了更新
 		block.sync();
-		if (range.x + progress < range.y)
-		{
-			atomicAdd(&(dL_dcolors[collected_id[block.thread_rank()] * C + 0]), collected_dL_dcolors[block.thread_rank() * C + 0]);
-			atomicAdd(&(dL_dcolors[collected_id[block.thread_rank()] * C + 1]), collected_dL_dcolors[block.thread_rank() * C + 1]);
-			atomicAdd(&(dL_dcolors[collected_id[block.thread_rank()] * C + 2]), collected_dL_dcolors[block.thread_rank() * C + 2]);
+			
+		// 从 shared memory 中读数, 做累加
+		if (block.thread_rank() < min(32, inner_toDo)) {
+			// 之后优化做合并访存 float4
+			// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
+			// coll_id 需要重新处理一下
+			const int coll_id = collected_id[loops * 32 + block.thread_rank()];
+			float dL_dmean2D_x = 0.f;
+			float dL_dmean2D_y = 0.f;
+			float dL_dconic2D_x = 0.f;
+			float dL_dconic2D_y = 0.f;
+			float dL_dconic2D_w = 0.f;
+			float dL_dopacity_it = 0.f;
+			float dL_dcolors_r = 0.f;
+			float dL_dcolors_g = 0.f;
+			float dL_dcolors_b = 0.f;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[collected_id[block.thread_rank()]].x, colleted_dL_dmeans2D[block.thread_rank()].x);
-			atomicAdd(&dL_dmean2D[collected_id[block.thread_rank()]].y, colleted_dL_dmeans2D[block.thread_rank()].y);
+			// TODO 此处可以再做 float 访存
+			for (int index = 0; index < 8; index++) {
+				const int idx = block.thread_rank() * 8 + index;
+				dL_dmean2D_x += collected_dL_dmeans2D[idx].x;
+				dL_dmean2D_y += collected_dL_dmeans2D[idx].y;
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[collected_id[block.thread_rank()]].x, collected_dL_dconic2D[block.thread_rank()].x);
-			atomicAdd(&dL_dconic2D[collected_id[block.thread_rank()]].y, collected_dL_dconic2D[block.thread_rank()].y);
-			atomicAdd(&dL_dconic2D[collected_id[block.thread_rank()]].w, collected_dL_dconic2D[block.thread_rank()].w);
+				dL_dconic2D_x += collected_dL_dconic2D[idx].x;
+				dL_dconic2D_y += collected_dL_dconic2D[idx].y;
+				dL_dconic2D_w += collected_dL_dconic2D[idx].w;
+				
+				dL_dopacity_it += collected_dL_dopacity[idx];
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[collected_id[block.thread_rank()]]), collected_dL_dopacity[block.thread_rank()]);
+				dL_dcolors_r += collected_dL_dcolors[idx * C + 0];
+				dL_dcolors_g += collected_dL_dcolors[idx * C + 1];
+				dL_dcolors_b += collected_dL_dcolors[idx * C + 2];
+			}
+
+			atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
+			atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
+			atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
+			atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
+			atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
+			atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
+			atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
+			atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
+			atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
+		}
 		}
 	}
 }
