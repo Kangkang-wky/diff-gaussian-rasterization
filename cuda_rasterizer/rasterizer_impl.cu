@@ -72,7 +72,7 @@ __global__ void duplicateWithKeys(
 	const float2* points_xy,
 	const float* depths,
 	const uint32_t* offsets,
-	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
 	dim3 grid)
@@ -99,9 +99,10 @@ __global__ void duplicateWithKeys(
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
+				// uint64 to uint32   tile_id uint16   depths uint16 
+				uint32_t key = y * grid.x + x;
+				key <<= 16;
+				key |= *((uint16_t*)&(__float2half(depths[idx])));
 				gaussian_keys_unsorted[off] = key;
 				gaussian_values_unsorted[off] = idx;
 				off++;
@@ -113,20 +114,20 @@ __global__ void duplicateWithKeys(
 // Check keys to see if it is at the start/end of one tile's range in 
 // the full sorted list. If yes, write start/end of this tile. 
 // Run once per instanced (duplicated) Gaussian ID.
-__global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
+__global__ void identifyTileRanges(int L, uint32_t* point_list_keys, uint2* ranges)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= L)
 		return;
 
 	// Read tile ID from key. Update start/end of tile range if at limit.
-	uint64_t key = point_list_keys[idx];
-	uint32_t currtile = key >> 32;
+	uint32_t key = point_list_keys[idx];
+	uint16_t currtile = key >> 16;
 	if (idx == 0)
 		ranges[currtile].x = 0;
 	else
 	{
-		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+		uint16_t prevtile = point_list_keys[idx - 1] >> 16;
 		if (currtile != prevtile)
 		{
 			ranges[prevtile].y = idx;
@@ -307,7 +308,7 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		num_rendered, 0, 16 + bit), debug)
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
