@@ -17,14 +17,15 @@ namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
-__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
+__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs_feature_dc, const float* shs_feature_rest, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs_feature_dc, glm::vec3* dL_dshs_feature_rest)
 {
 	// Compute intermediate values, as it is done during forward
 	glm::vec3 pos = means[idx];
 	glm::vec3 dir_orig = pos - campos;
 	glm::vec3 dir = dir_orig / glm::length(dir_orig);
 
-	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
+	glm::vec3* sh_feature_dc = ((glm::vec3*)shs_feature_dc) + idx * 1;
+	glm::vec3* sh_feature_rest = ((glm::vec3*)shs_feature_rest) + idx * (max_coeffs - 1);
 
 	// Use PyTorch rule for clamping: if clamping was applied,
 	// gradient becomes 0.
@@ -41,23 +42,24 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	float z = dir.z;
 
 	// Target location for this Gaussian to write SH gradients to
-	glm::vec3* dL_dsh = dL_dshs + idx * max_coeffs;
+	glm::vec3* dL_dsh_feature_dc = dL_dshs_feature_dc + idx * 1;
+	glm::vec3* dL_dsh_feature_rest = dL_dshs_feature_rest + idx * (max_coeffs - 1);
 
 	// No tricks here, just high school-level calculus.
 	float dRGBdsh0 = SH_C0;
-	dL_dsh[0] = dRGBdsh0 * dL_dRGB;
+	dL_dsh_feature_dc[0] = dRGBdsh0 * dL_dRGB;
 	if (deg > 0)
 	{
 		float dRGBdsh1 = -SH_C1 * y;
 		float dRGBdsh2 = SH_C1 * z;
 		float dRGBdsh3 = -SH_C1 * x;
-		dL_dsh[1] = dRGBdsh1 * dL_dRGB;
-		dL_dsh[2] = dRGBdsh2 * dL_dRGB;
-		dL_dsh[3] = dRGBdsh3 * dL_dRGB;
+		dL_dsh_feature_rest[0] = dRGBdsh1 * dL_dRGB;
+		dL_dsh_feature_rest[1] = dRGBdsh2 * dL_dRGB;
+		dL_dsh_feature_rest[2] = dRGBdsh3 * dL_dRGB;
 
-		dRGBdx = -SH_C1 * sh[3];
-		dRGBdy = -SH_C1 * sh[1];
-		dRGBdz = SH_C1 * sh[2];
+		dRGBdx = -SH_C1 * sh_feature_rest[2];
+		dRGBdy = -SH_C1 * sh_feature_rest[0];
+		dRGBdz = SH_C1 * sh_feature_rest[1];
 
 		if (deg > 1)
 		{
@@ -69,15 +71,15 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 			float dRGBdsh6 = SH_C2[2] * (2.f * zz - xx - yy);
 			float dRGBdsh7 = SH_C2[3] * xz;
 			float dRGBdsh8 = SH_C2[4] * (xx - yy);
-			dL_dsh[4] = dRGBdsh4 * dL_dRGB;
-			dL_dsh[5] = dRGBdsh5 * dL_dRGB;
-			dL_dsh[6] = dRGBdsh6 * dL_dRGB;
-			dL_dsh[7] = dRGBdsh7 * dL_dRGB;
-			dL_dsh[8] = dRGBdsh8 * dL_dRGB;
+			dL_dsh_feature_rest[3] = dRGBdsh4 * dL_dRGB;
+			dL_dsh_feature_rest[4] = dRGBdsh5 * dL_dRGB;
+			dL_dsh_feature_rest[5] = dRGBdsh6 * dL_dRGB;
+			dL_dsh_feature_rest[6] = dRGBdsh7 * dL_dRGB;
+			dL_dsh_feature_rest[7] = dRGBdsh8 * dL_dRGB;
 
-			dRGBdx += SH_C2[0] * y * sh[4] + SH_C2[2] * 2.f * -x * sh[6] + SH_C2[3] * z * sh[7] + SH_C2[4] * 2.f * x * sh[8];
-			dRGBdy += SH_C2[0] * x * sh[4] + SH_C2[1] * z * sh[5] + SH_C2[2] * 2.f * -y * sh[6] + SH_C2[4] * 2.f * -y * sh[8];
-			dRGBdz += SH_C2[1] * y * sh[5] + SH_C2[2] * 2.f * 2.f * z * sh[6] + SH_C2[3] * x * sh[7];
+			dRGBdx += SH_C2[0] * y * sh_feature_rest[3] + SH_C2[2] * 2.f * -x * sh_feature_rest[5] + SH_C2[3] * z * sh_feature_rest[6] + SH_C2[4] * 2.f * x * sh_feature_rest[7];
+			dRGBdy += SH_C2[0] * x * sh_feature_rest[3] + SH_C2[1] * z * sh_feature_rest[4] + SH_C2[2] * 2.f * -y * sh_feature_rest[5] + SH_C2[4] * 2.f * -y * sh_feature_rest[7];
+			dRGBdz += SH_C2[1] * y * sh_feature_rest[4] + SH_C2[2] * 2.f * 2.f * z * sh_feature_rest[5] + SH_C2[3] * x * sh_feature_rest[6];
 
 			if (deg > 2)
 			{
@@ -88,38 +90,38 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 				float dRGBdsh13 = SH_C3[4] * x * (4.f * zz - xx - yy);
 				float dRGBdsh14 = SH_C3[5] * z * (xx - yy);
 				float dRGBdsh15 = SH_C3[6] * x * (xx - 3.f * yy);
-				dL_dsh[9] = dRGBdsh9 * dL_dRGB;
-				dL_dsh[10] = dRGBdsh10 * dL_dRGB;
-				dL_dsh[11] = dRGBdsh11 * dL_dRGB;
-				dL_dsh[12] = dRGBdsh12 * dL_dRGB;
-				dL_dsh[13] = dRGBdsh13 * dL_dRGB;
-				dL_dsh[14] = dRGBdsh14 * dL_dRGB;
-				dL_dsh[15] = dRGBdsh15 * dL_dRGB;
+				dL_dsh_feature_rest[8] = dRGBdsh9 * dL_dRGB;
+				dL_dsh_feature_rest[9] = dRGBdsh10 * dL_dRGB;
+				dL_dsh_feature_rest[10] = dRGBdsh11 * dL_dRGB;
+				dL_dsh_feature_rest[11] = dRGBdsh12 * dL_dRGB;
+				dL_dsh_feature_rest[12] = dRGBdsh13 * dL_dRGB;
+				dL_dsh_feature_rest[13] = dRGBdsh14 * dL_dRGB;
+				dL_dsh_feature_rest[14] = dRGBdsh15 * dL_dRGB;
 
 				dRGBdx += (
-					SH_C3[0] * sh[9] * 3.f * 2.f * xy +
-					SH_C3[1] * sh[10] * yz +
-					SH_C3[2] * sh[11] * -2.f * xy +
-					SH_C3[3] * sh[12] * -3.f * 2.f * xz +
-					SH_C3[4] * sh[13] * (-3.f * xx + 4.f * zz - yy) +
-					SH_C3[5] * sh[14] * 2.f * xz +
-					SH_C3[6] * sh[15] * 3.f * (xx - yy));
+					SH_C3[0] * sh_feature_rest[8] * 3.f * 2.f * xy +
+					SH_C3[1] * sh_feature_rest[9] * yz +
+					SH_C3[2] * sh_feature_rest[10] * -2.f * xy +
+					SH_C3[3] * sh_feature_rest[11] * -3.f * 2.f * xz +
+					SH_C3[4] * sh_feature_rest[12] * (-3.f * xx + 4.f * zz - yy) +
+					SH_C3[5] * sh_feature_rest[13] * 2.f * xz +
+					SH_C3[6] * sh_feature_rest[14] * 3.f * (xx - yy));
 
 				dRGBdy += (
-					SH_C3[0] * sh[9] * 3.f * (xx - yy) +
-					SH_C3[1] * sh[10] * xz +
-					SH_C3[2] * sh[11] * (-3.f * yy + 4.f * zz - xx) +
-					SH_C3[3] * sh[12] * -3.f * 2.f * yz +
-					SH_C3[4] * sh[13] * -2.f * xy +
-					SH_C3[5] * sh[14] * -2.f * yz +
-					SH_C3[6] * sh[15] * -3.f * 2.f * xy);
+					SH_C3[0] * sh_feature_rest[8] * 3.f * (xx - yy) +
+					SH_C3[1] * sh_feature_rest[9] * xz +
+					SH_C3[2] * sh_feature_rest[10] * (-3.f * yy + 4.f * zz - xx) +
+					SH_C3[3] * sh_feature_rest[11] * -3.f * 2.f * yz +
+					SH_C3[4] * sh_feature_rest[12] * -2.f * xy +
+					SH_C3[5] * sh_feature_rest[13] * -2.f * yz +
+					SH_C3[6] * sh_feature_rest[14] * -3.f * 2.f * xy);
 
 				dRGBdz += (
-					SH_C3[1] * sh[10] * xy +
-					SH_C3[2] * sh[11] * 4.f * 2.f * yz +
-					SH_C3[3] * sh[12] * 3.f * (2.f * zz - xx - yy) +
-					SH_C3[4] * sh[13] * 4.f * 2.f * xz +
-					SH_C3[5] * sh[14] * (xx - yy));
+					SH_C3[1] * sh_feature_rest[9] * xy +
+					SH_C3[2] * sh_feature_rest[10] * 4.f * 2.f * yz +
+					SH_C3[3] * sh_feature_rest[11] * 3.f * (2.f * zz - xx - yy) +
+					SH_C3[4] * sh_feature_rest[12] * 4.f * 2.f * xz +
+					SH_C3[5] * sh_feature_rest[13] * (xx - yy));
 			}
 		}
 	}
@@ -348,18 +350,20 @@ __global__ void preprocessCUDA(
 	int P, int D, int M,
 	const float3* means,
 	const int* radii,
-	const float* shs,
+	const float* shs_feature_dc,
+	const float* shs_feature_rest,
 	const bool* clamped,
 	const glm::vec3* scales,
 	const glm::vec4* rotations,
 	const float scale_modifier,
 	const float* proj,
 	const glm::vec3* campos,
-	const float3* dL_dmean2D,
+	const float2* dL_dmean2D,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
 	float* dL_dcov3D,
-	float* dL_dsh,
+	float* dL_dsh_feature_dc,
+	float* dL_dsh_feature_rest,
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
 {
@@ -387,8 +391,8 @@ __global__ void preprocessCUDA(
 	dL_dmeans[idx] += dL_dmean;
 
 	// Compute gradient updates due to computing colors from SHs
-	if (shs)
-		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
+	if (shs_feature_dc)
+		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs_feature_dc, shs_feature_rest, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh_feature_dc, (glm::vec3*)dL_dsh_feature_rest);
 
 	// Compute gradient updates due to computing covariance from scale/rotation
 	if (scales)
@@ -409,7 +413,7 @@ renderCUDA(
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
-	float3* __restrict__ dL_dmean2D,
+	float2* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors)
@@ -560,7 +564,8 @@ void BACKWARD::preprocess(
 	int P, int D, int M,
 	const float3* means3D,
 	const int* radii,
-	const float* shs,
+	const float* shs_feature_dc,
+	const float* shs_feature_rest,
 	const bool* clamped,
 	const glm::vec3* scales,
 	const glm::vec4* rotations,
@@ -571,12 +576,13 @@ void BACKWARD::preprocess(
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
 	const glm::vec3* campos,
-	const float3* dL_dmean2D,
+	const float2* dL_dmean2D,
 	const float* dL_dconic,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
 	float* dL_dcov3D,
-	float* dL_dsh,
+	float* dL_dsh_feature_dc,
+	float* dL_dsh_feature_rest,	
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
 {
@@ -605,18 +611,20 @@ void BACKWARD::preprocess(
 		P, D, M,
 		(float3*)means3D,
 		radii,
-		shs,
+		shs_feature_dc,
+		shs_feature_rest,
 		clamped,
 		(glm::vec3*)scales,
 		(glm::vec4*)rotations,
 		scale_modifier,
 		projmatrix,
 		campos,
-		(float3*)dL_dmean2D,
+		(float2*)dL_dmean2D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
-		dL_dsh,
+		dL_dsh_feature_dc,
+		dL_dsh_feature_rest,
 		dL_dscale,
 		dL_drot);
 }
@@ -633,7 +641,7 @@ void BACKWARD::render(
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
-	float3* dL_dmean2D,
+	float2* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors)
