@@ -417,6 +417,20 @@ __device__ __forceinline__ float warpReduceSum(float partial_sum) {
   return partial_sum;
 }
 
+// 做 atomicadd 之前的一次向量化访存, 尝试将 atomicadd 与其交错
+template <typename Datatype, int ELEMENTS_LDG>
+__device__ __forceinline__ void copy_vector(Datatype *dst, Datatype *src);
+
+template <>
+__device__ __forceinline__ void copy_vector<float, 2>(float *dst, float *src) {
+	*(reinterpret_cast<float2*>(dst)) = *(reinterpret_cast<float2*>(src));
+}
+
+template <>
+__device__ __forceinline__ void copy_vector<float, 4>(float *dst, float *src) {
+	*(reinterpret_cast<float4*>(dst)) = *(reinterpret_cast<float4*>(src));
+}
+
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
