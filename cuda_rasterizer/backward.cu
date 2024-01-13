@@ -430,7 +430,8 @@ template <>
 __device__ __forceinline__ void copy_vector<float, 4>(float *dst, float *src) {
 	*(reinterpret_cast<float4*>(dst)) = *(reinterpret_cast<float4*>(src));
 }
-
+// smoke test shows that three software pipeline accelerate 
+// ToDo: buffer three
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
