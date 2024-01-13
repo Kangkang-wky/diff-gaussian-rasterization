@@ -472,10 +472,13 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 
-	__shared__ float collected_dL_dcolors[C * BLOCK_SIZE];
-	__shared__ float4 collected_dL_dconic2D[BLOCK_SIZE];
-	__shared__ float2 collected_dL_dmeans2D[BLOCK_SIZE];
-	__shared__ float collected_dL_dopacity[BLOCK_SIZE];
+	// 把 opacity 合并到 dL_dconic2D 的一个维度当中 x y z w
+	// opacity 使用 z 维度即可
+	// 将 dL_dmeans2d_y 合并到 collceted_dL_dcolors 的一个维度当中 即可 x y z w
+	// means2D_y 使用 w 维度即可
+	__shared__ float4 collected_dL_dcolors_means2d_y[BLOCK_SIZE];
+	__shared__ float4 collected_dL_dconic2D_opacity[BLOCK_SIZE];
+	__shared__ float collected_dL_dmeans2D_means2d_x[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -548,17 +551,11 @@ renderCUDA(
 		block.sync();
 
 		// shared memory dL 更新值
-		for (int ch = 0; ch < C; ch++) {
-			collected_dL_dcolors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
-		}
-		
-		collected_dL_dconic2D[block.thread_rank()].x = 0.0f;
-		collected_dL_dconic2D[block.thread_rank()].y = 0.0f;
-		collected_dL_dconic2D[block.thread_rank()].w = 0.0f;
-		
-		collected_dL_dmeans2D[block.thread_rank()] = float2{0.0f, 0.0f};
 
-		collected_dL_dopacity[block.thread_rank()] = 0.0f;
+		collected_dL_dcolors_means2d_y[block.thread_rank()] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+		collected_dL_dconic2D_opacity[block.thread_rank()] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+		collected_dL_dmeans2D_means2d_x[block.thread_rank()] = 0.0f;
+
 		// shared memory 更新完毕
 
 		block.sync();
@@ -685,18 +682,10 @@ renderCUDA(
 				// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
 				if (lane_id == 0) {
 
-					collected_dL_dcolors[idx * C + 0] = shuffle_dcolor_x;
-					collected_dL_dcolors[idx * C + 1] = shuffle_dcolor_y;
-					collected_dL_dcolors[idx * C + 2] = shuffle_dcolor_z;
+					collected_dL_dcolors_means2d_y[idx] = float4{shuffle_dcolor_x, shuffle_dcolor_y, shuffle_dcolor_z, shuffle_dmean2D_y};
+					collected_dL_dconic2D_opacity[idx] = float4{shuffle_dconic2D_x, shuffle_dconic2D_y, shuffle_dopacity, shuffle_dconic2D_w};
+					collected_dL_dmeans2D_means2d_x[idx] = shuffle_dmean2D_x;
 
-					collected_dL_dmeans2D[idx].x = shuffle_dmean2D_x;
-					collected_dL_dmeans2D[idx].y = shuffle_dmean2D_y;
-
-					collected_dL_dconic2D[idx].x = shuffle_dconic2D_x;
-					collected_dL_dconic2D[idx].y = shuffle_dconic2D_y;
-					collected_dL_dconic2D[idx].w = shuffle_dconic2D_w;
-	
-					collected_dL_dopacity[idx] = shuffle_dopacity;
 				}
 			}
 		}
@@ -720,32 +709,44 @@ renderCUDA(
 			float dL_dcolors_g = 0.f;
 			float dL_dcolors_b = 0.f;
 
-			// TODO 此处可以再做 float 访存
+			// means2d_y 在 w 维度, opacity 在 z 维度
+			// means2dx 单独一个 float 类型
+
 			for (int index = 0; index < 8; index++) {
 				const int idx = block.thread_rank() * 8 + index;
-				dL_dmean2D_x += collected_dL_dmeans2D[idx].x;
-				dL_dmean2D_y += collected_dL_dmeans2D[idx].y;
-
-				dL_dconic2D_x += collected_dL_dconic2D[idx].x;
-				dL_dconic2D_y += collected_dL_dconic2D[idx].y;
-				dL_dconic2D_w += collected_dL_dconic2D[idx].w;
+				float4 conic2D_opacity= collected_dL_dconic2D_opacity[idx];
+				float4 colors_means2d_y = collected_dL_dcolors_means2d_y[idx];
 				
-				dL_dopacity_it += collected_dL_dopacity[idx];
+				dL_dconic2D_x += conic2D_opacity.x;
+				dL_dconic2D_y += conic2D_opacity.y;
+				dL_dconic2D_w += conic2D_opacity.w;
+				dL_dopacity_it += conic2D_opacity.z;
 
-				dL_dcolors_r += collected_dL_dcolors[idx * C + 0];
-				dL_dcolors_g += collected_dL_dcolors[idx * C + 1];
-				dL_dcolors_b += collected_dL_dcolors[idx * C + 2];
+				dL_dcolors_r += colors_means2d_y.x;
+				dL_dcolors_g += colors_means2d_y.y;
+				dL_dcolors_b += colors_means2d_y.z;
+				dL_dmean2D_y += colors_means2d_y.w;
+
+			}
+
+			atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
+			atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
+			atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
+			atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
+
+			atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
+			atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
+			atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
+            atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
+
+			for (int index = 0; index < 8; index += 4) {
+				float means2d_x[4];
+				const int idx = block.thread_rank() * 8 + index;
+				copy_vector<float, 4>(static_cast<float*>(&means2d_x[0]) , static_cast<float*>(&collected_dL_dmeans2D_means2d_x[idx]));
+				dL_dmean2D_x += (means2d_x[0] + means2d_x[1] + means2d_x[2] + means2d_x[3]);
 			}
 
 			atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
-			atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
-			atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
-			atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
-			atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
-			atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
-			atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
-			atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
-			atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
 		}
 		}
 	}
