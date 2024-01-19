@@ -609,7 +609,7 @@ renderCUDA(
 					con_o = collected_conic_opacity[loops * 32 + j];
 					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 					if (power <= 0.0f) {
-						G = exp(power);
+						G = __expf(power);
 						alpha = min(ALPHA_LIMIT, con_o.w * G);
 						if (alpha >= ALPHA_THRESHOLD) {
 							flag = true;
@@ -771,7 +771,7 @@ renderCUDA(
 					con_o = collected_conic_opacity[loops * 32 + j];
 					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 					if (power <= 0.0f) {
-						G = exp(power);
+						G = __expf(power);
 						alpha = min(ALPHA_LIMIT, con_o.w * G);
 						if (alpha >= ALPHA_THRESHOLD) {
 							flag = true;
