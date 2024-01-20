@@ -451,12 +451,15 @@ renderCUDA(
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
-	const uint2 pix = { block.group_index().x * BLOCK_X + block.thread_index().x, block.group_index().y * BLOCK_Y + block.thread_index().y };
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float2 pixf = { (float)pix.x, (float)pix.y };
 
 	const bool inside = pix.x < W&& pix.y < H;
-	const uint2 range = ranges[block.group_index().y * gridDim.x + block.group_index().x];
+	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
@@ -468,11 +471,11 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 
-	// pipeline double buffer
-	__shared__ float collected_dL_dcolors[2][C * BLOCK_SIZE];
-	__shared__ float4 collected_dL_dconic2D[2][BLOCK_SIZE];
-	__shared__ float2 collected_dL_dmeans2D[2][BLOCK_SIZE];
-	__shared__ float collected_dL_dopacity[2][BLOCK_SIZE];
+	// pipeline 3 buffer
+	__shared__ float collected_dL_dcolors[3][C * BLOCK_SIZE];
+	__shared__ float4 collected_dL_dconic2D[3][BLOCK_SIZE];
+	__shared__ float2 collected_dL_dmeans2D[3][BLOCK_SIZE];
+	__shared__ float collected_dL_dopacity[3][BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -540,419 +543,842 @@ renderCUDA(
 		// loops 内循环次数, 内循环被拆分成 32 个高斯球
 		const int inner_rounds = (max_gaussian_inner + 32 - 1) / 32;
 
-		int double_buffer_flag = 0;
+		int tribble_buffer[3] = {0, 1, 2};
 		int loops = 0;
 
-		// shared memory dL 更新值
-		for (int ch = 0; ch < C; ch++) {
-			collected_dL_dcolors[double_buffer_flag][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
-		}
-		
-		collected_dL_dconic2D[double_buffer_flag][block.thread_rank()].x = 0.0f;
-		collected_dL_dconic2D[double_buffer_flag][block.thread_rank()].y = 0.0f;
-		collected_dL_dconic2D[double_buffer_flag][block.thread_rank()].w = 0.0f;
-		
-		collected_dL_dmeans2D[double_buffer_flag][block.thread_rank()] = float2{0.0f, 0.0f};
+		if (inner_rounds == 1 || inner_rounds == 2) {
+			for (; loops < inner_rounds; loops++, inner_toDo -= 32) {
 
-		collected_dL_dopacity[double_buffer_flag][block.thread_rank()] = 0.0f;
-		// shared memory 更新完毕
+				block.sync();
 
-		block.sync();
+				// shared memory dL 更新值
+				for (int ch = 0; ch < C; ch++) {
+					collected_dL_dcolors[tribble_buffer[0]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+				}
+				
+				collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].x = 0.0f;
+				collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].y = 0.0f;
+				collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].w = 0.0f;
+				
+				collected_dL_dmeans2D[tribble_buffer[0]][block.thread_rank()] = float2{0.0f, 0.0f};
 
-		// 更新 loops 0 中计算值
-		// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
-		for (int j = 0; j < min(32, inner_toDo); j++)
-		{
-			// Keep track of current Gaussian ID. Skip, if this one
-			// is behind the last contributor for this pixel.
-			float2 xy;
-			float2 d;
-			float4 con_o;
-			float power;
-			float G;
-			float alpha;
-			float dchannel_dcolor;
-			float dL_dalpha;
+				collected_dL_dopacity[tribble_buffer[0]][block.thread_rank()] = 0.0f;
+				// shared memory 更新完毕
 
-			float bg_dot_dpixel;   
-			float dL_dchannel;     
-			float c;           
+				block.sync();
 
-			float dL_dG;         
-			float gdx;
-			float gdy;
-			float dG_ddelx;
-			float dG_ddely;                                                                                                                                                                                         
+				// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
+				for (int j = 0; j < min(32, inner_toDo); j++)
+				{
+					// Keep track of current Gaussian ID. Skip, if this one
+					// is behind the last contributor for this pixel.
+					float2 xy;
+					float2 d;
+					float4 con_o;
+					float power;
+					float G;
+					float alpha;
+					float dchannel_dcolor;
+					float dL_dalpha;
 
-			shuffle_dmean2D_x = 0.0f;
-			shuffle_dmean2D_y = 0.0f;
-			shuffle_dconic2D_x = 0.0f;
-			shuffle_dconic2D_y = 0.0f;
-			shuffle_dconic2D_w = 0.0f;
-			shuffle_dopacity = 0.0f;
-			shuffle_dcolor_x = 0.0f;
-			shuffle_dcolor_y = 0.0f;
-			shuffle_dcolor_z = 0.0f;
-			flag = false;
-			
-			if (!done) {
-				contributor--;
-				if (contributor < last_contributor) {
-					// Compute blending values, as before.
-					xy = collected_xy[loops * 32 + j];
-					d = { xy.x - pixf.x, xy.y - pixf.y };
-					con_o = collected_conic_opacity[loops * 32 + j];
-					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-					if (power <= 0.0f) {
-						G = exp(power);
-						alpha = min(0.99f, con_o.w * G);
-						if (alpha >= 1.0f / 255.0f) {
-							flag = true;
-			
-							T = T / (1.f - alpha);
-							dchannel_dcolor = alpha * T;
+					float bg_dot_dpixel;   
+					float dL_dchannel;     
+					float c;           
 
-							// Propagate gradients to per-Gaussian colors and keep
-							// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-							// pair).
-							dL_dalpha = 0.0f;
-							// const int global_id = collected_id[j];
-							for (int ch = 0; ch < C; ch++)
-							{
-								c = collected_colors[ch * BLOCK_SIZE + loops * 32 + j];
-								// Update last color (to be used in the next iteration)
-								accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-								last_color[ch] = c;
+					float dL_dG;         
+					float gdx;
+					float gdy;
+					float dG_ddelx;
+					float dG_ddely;                                                                                                                                                                                         
 
-								dL_dchannel = dL_dpixel[ch];
-								dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-								// Update the gradients w.r.t. color of the Gaussian. 
-								// Atomic, since this pixel is just one of potentially
-								// many that were affected by this Gaussian.
-								if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
-								else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
-								else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
-								// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+					shuffle_dmean2D_x = 0.0f;
+					shuffle_dmean2D_y = 0.0f;
+					shuffle_dconic2D_x = 0.0f;
+					shuffle_dconic2D_y = 0.0f;
+					shuffle_dconic2D_w = 0.0f;
+					shuffle_dopacity = 0.0f;
+					shuffle_dcolor_x = 0.0f;
+					shuffle_dcolor_y = 0.0f;
+					shuffle_dcolor_z = 0.0f;
+					flag = false;
+					
+					if (!done) {
+						contributor--;
+						if (contributor < last_contributor) {
+							// Compute blending values, as before.
+							xy = collected_xy[loops * 32 + j];
+							d = { xy.x - pixf.x, xy.y - pixf.y };
+							con_o = collected_conic_opacity[loops * 32 + j];
+							power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+							if (power <= 0.0f) {
+								G = exp(power);
+								alpha = min(ALPHA_LIMIT, con_o.w * G);
+								if (alpha >= ALPHA_THRESHOLD) {
+									flag = true;
+					
+									T = T / (1.f - alpha);
+									dchannel_dcolor = alpha * T;
+
+									// Propagate gradients to per-Gaussian colors and keep
+									// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+									// pair).
+									dL_dalpha = 0.0f;
+									// const int global_id = collected_id[j];
+									for (int ch = 0; ch < C; ch++)
+									{
+										c = collected_colors[ch * BLOCK_SIZE + loops * 32 + j];
+										// Update last color (to be used in the next iteration)
+										accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+										last_color[ch] = c;
+
+										dL_dchannel = dL_dpixel[ch];
+										dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+										// Update the gradients w.r.t. color of the Gaussian. 
+										// Atomic, since this pixel is just one of potentially
+										// many that were affected by this Gaussian.
+										if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
+										else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
+										else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
+										// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+									}
+									dL_dalpha *= T;
+									// Update last alpha (to be used in the next iteration)
+									last_alpha = alpha;
+
+									// Account for fact that alpha also influences how much of
+									// the background color is added if nothing left to blend
+									bg_dot_dpixel = 0;
+									for (int i = 0; i < C; i++)
+										bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+									dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+
+									// Helpful reusable temporary variables
+									dL_dG = con_o.w * dL_dalpha;
+									gdx = G * d.x;
+									gdy = G * d.y;
+									dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+									dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+									shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
+									shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
+									shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
+									shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
+									shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
+									shuffle_dopacity = G * dL_dalpha;
+								}
 							}
-							dL_dalpha *= T;
-							// Update last alpha (to be used in the next iteration)
-							last_alpha = alpha;
+						}
+					}
 
-							// Account for fact that alpha also influences how much of
-							// the background color is added if nothing left to blend
-							bg_dot_dpixel = 0;
-							for (int i = 0; i < C; i++)
-								bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-							dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+					unsigned active = __activemask();
+					unsigned shuffle_flag = __ballot_sync(active, flag == true);
+					// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
+					if (__any_sync(active, flag == true)) {
+						shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
+						shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
+						shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
+						
+						shuffle_dmean2D_x = warpReduceSum<WARPSIZE>(shuffle_dmean2D_x);
+						shuffle_dmean2D_y = warpReduceSum<WARPSIZE>(shuffle_dmean2D_y);
 
+						shuffle_dconic2D_x = warpReduceSum<WARPSIZE>(shuffle_dconic2D_x);
+						shuffle_dconic2D_y = warpReduceSum<WARPSIZE>(shuffle_dconic2D_y);
+						shuffle_dconic2D_w = warpReduceSum<WARPSIZE>(shuffle_dconic2D_w);
 
-							// Helpful reusable temporary variables
-							dL_dG = con_o.w * dL_dalpha;
-							gdx = G * d.x;
-							gdy = G * d.y;
-							dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-							dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+						shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
 
-							shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
-							shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
-							shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
-							shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
-							shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
-							shuffle_dopacity = G * dL_dalpha;
+						const int idx = j * 8 + warp_id;
+						// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
+						if (lane_id == 0) {
+
+							collected_dL_dcolors[tribble_buffer[0]][idx * C + 0] = shuffle_dcolor_x;
+							collected_dL_dcolors[tribble_buffer[0]][idx * C + 1] = shuffle_dcolor_y;
+							collected_dL_dcolors[tribble_buffer[0]][idx * C + 2] = shuffle_dcolor_z;
+
+							collected_dL_dmeans2D[tribble_buffer[0]][idx].x = shuffle_dmean2D_x;
+							collected_dL_dmeans2D[tribble_buffer[0]][idx].y = shuffle_dmean2D_y;
+
+							collected_dL_dconic2D[tribble_buffer[0]][idx].x = shuffle_dconic2D_x;
+							collected_dL_dconic2D[tribble_buffer[0]][idx].y = shuffle_dconic2D_y;
+							collected_dL_dconic2D[tribble_buffer[0]][idx].w = shuffle_dconic2D_w;
+			
+
+							collected_dL_dopacity[tribble_buffer[0]][idx] = shuffle_dopacity;
 						}
 					}
 				}
-			}
-			// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
-			if (__any_sync(0xffffffff, flag == true)) {
-				shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
-				shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
-				shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
-				
-				shuffle_dmean2D_x = warpReduceSum<WARPSIZE>(shuffle_dmean2D_x);
-				shuffle_dmean2D_y = warpReduceSum<WARPSIZE>(shuffle_dmean2D_y);
 
-				shuffle_dconic2D_x = warpReduceSum<WARPSIZE>(shuffle_dconic2D_x);
-				shuffle_dconic2D_y = warpReduceSum<WARPSIZE>(shuffle_dconic2D_y);
-				shuffle_dconic2D_w = warpReduceSum<WARPSIZE>(shuffle_dconic2D_w);
+				// shared 上同步 32 个高斯球的梯度已经完成了更新
+				block.sync();
+					
+				// 从 shared memory 中读数, 做累加
+				if (block.thread_rank() < min(32, inner_toDo)) {
+					// 之后优化做合并访存 float4
+					// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
+					// coll_id 需要重新处理一下
+					const int coll_id = collected_id[loops * 32 + block.thread_rank()];
+					float dL_dmean2D_x = 0.f;
+					float dL_dmean2D_y = 0.f;
+					float dL_dconic2D_x = 0.f;
+					float dL_dconic2D_y = 0.f;
+					float dL_dconic2D_w = 0.f;
+					float dL_dopacity_it = 0.f;
+					float dL_dcolors_r = 0.f;
+					float dL_dcolors_g = 0.f;
+					float dL_dcolors_b = 0.f;
 
-				shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
+					// TODO 此处可以再做 float 访存
+					for (int z = 0; z < 8; z++) {
+						const int idx = block.thread_rank() * 8 + z;
+						dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
+						dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
 
-				const int idx = j * 8 + warp_id;
-				// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
-				if (lane_id == 0) {
+						dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
+						dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
+						dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+						
+						dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
 
-					collected_dL_dcolors[double_buffer_flag][idx * C + 0] = shuffle_dcolor_x;
-					collected_dL_dcolors[double_buffer_flag][idx * C + 1] = shuffle_dcolor_y;
-					collected_dL_dcolors[double_buffer_flag][idx * C + 2] = shuffle_dcolor_z;
+						dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
+						dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
+						dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+					}
 
-					collected_dL_dmeans2D[double_buffer_flag][idx].x = shuffle_dmean2D_x;
-					collected_dL_dmeans2D[double_buffer_flag][idx].y = shuffle_dmean2D_y;
-
-					collected_dL_dconic2D[double_buffer_flag][idx].x = shuffle_dconic2D_x;
-					collected_dL_dconic2D[double_buffer_flag][idx].y = shuffle_dconic2D_y;
-					collected_dL_dconic2D[double_buffer_flag][idx].w = shuffle_dconic2D_w;
-	
-					collected_dL_dopacity[double_buffer_flag][idx] = shuffle_dopacity;
+					atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
+					atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
+					atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
+					atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
+					atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
+					atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
+					atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
+					atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
+					atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
 				}
 			}
+
 		}
+		else {
+			// 预取  流水线 prefetch 1
 
-		// 将循环中的值进行更新
-		inner_toDo -= 32;
-		loops++;
-
-		for (; loops < inner_rounds; loops++, inner_toDo -= 32) {
-
-		block.sync();
-
-		// shared memory dL 更新值
-		for (int ch = 0; ch < C; ch++) {
-			collected_dL_dcolors[double_buffer_flag ^ 1][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
-		}
-		
-		collected_dL_dconic2D[double_buffer_flag ^ 1][block.thread_rank()].x = 0.0f;
-		collected_dL_dconic2D[double_buffer_flag ^ 1][block.thread_rank()].y = 0.0f;
-		collected_dL_dconic2D[double_buffer_flag ^ 1][block.thread_rank()].w = 0.0f;
-		
-		collected_dL_dmeans2D[double_buffer_flag ^ 1][block.thread_rank()] = float2{0.0f, 0.0f};
-
-		collected_dL_dopacity[double_buffer_flag ^ 1][block.thread_rank()] = 0.0f;
-		// shared memory 更新完毕
-
-		block.sync();
-
-		// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
-		for (int j = 0; j < min(32, inner_toDo); j++)
-		{
-			// Keep track of current Gaussian ID. Skip, if this one
-			// is behind the last contributor for this pixel.
-			float2 xy;
-			float2 d;
-			float4 con_o;
-			float power;
-			float G;
-			float alpha;
-			float dchannel_dcolor;
-			float dL_dalpha;
-
-			float bg_dot_dpixel;   
-			float dL_dchannel;     
-			float c;           
-
-			float dL_dG;         
-			float gdx;
-			float gdy;
-			float dG_ddelx;
-			float dG_ddely;                                                                                                                                                                                         
-
-			shuffle_dmean2D_x = 0.0f;
-			shuffle_dmean2D_y = 0.0f;
-			shuffle_dconic2D_x = 0.0f;
-			shuffle_dconic2D_y = 0.0f;
-			shuffle_dconic2D_w = 0.0f;
-			shuffle_dopacity = 0.0f;
-			shuffle_dcolor_x = 0.0f;
-			shuffle_dcolor_y = 0.0f;
-			shuffle_dcolor_z = 0.0f;
-			flag = false;
+			// shared memory dL 更新值
+			for (int ch = 0; ch < C; ch++) {
+				collected_dL_dcolors[tribble_buffer[0]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+			}
 			
-			if (!done) {
-				contributor--;
-				if (contributor < last_contributor) {
-					// Compute blending values, as before.
-					xy = collected_xy[loops * 32 + j];
-					d = { xy.x - pixf.x, xy.y - pixf.y };
-					con_o = collected_conic_opacity[loops * 32 + j];
-					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-					if (power <= 0.0f) {
-						G = exp(power);
-						alpha = min(0.99f, con_o.w * G);
-						if (alpha >= 1.0f / 255.0f) {
-							flag = true;
+			collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].x = 0.0f;
+			collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].y = 0.0f;
+			collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].w = 0.0f;
 			
-							T = T / (1.f - alpha);
-							dchannel_dcolor = alpha * T;
+			collected_dL_dmeans2D[tribble_buffer[0]][block.thread_rank()] = float2{0.0f, 0.0f};
 
-							// Propagate gradients to per-Gaussian colors and keep
-							// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-							// pair).
-							dL_dalpha = 0.0f;
-							// const int global_id = collected_id[j];
-							for (int ch = 0; ch < C; ch++)
-							{
-								c = collected_colors[ch * BLOCK_SIZE + loops * 32 + j];
-								// Update last color (to be used in the next iteration)
-								accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-								last_color[ch] = c;
+			collected_dL_dopacity[tribble_buffer[0]][block.thread_rank()] = 0.0f;
+			// shared memory 更新完毕
+			block.sync();
 
-								dL_dchannel = dL_dpixel[ch];
-								dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-								// Update the gradients w.r.t. color of the Gaussian. 
-								// Atomic, since this pixel is just one of potentially
-								// many that were affected by this Gaussian.
-								if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
-								else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
-								else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
-								// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+			//  流水线  预取 2 
+			for (int ch = 0; ch < C; ch++) {
+				collected_dL_dcolors[tribble_buffer[1]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+			}
+			
+			collected_dL_dconic2D[tribble_buffer[1]][block.thread_rank()].x = 0.0f;
+			collected_dL_dconic2D[tribble_buffer[1]][block.thread_rank()].y = 0.0f;
+			collected_dL_dconic2D[tribble_buffer[1]][block.thread_rank()].w = 0.0f;
+			
+			collected_dL_dmeans2D[tribble_buffer[1]][block.thread_rank()] = float2{0.0f, 0.0f};
+
+			collected_dL_dopacity[tribble_buffer[1]][block.thread_rank()] = 0.0f;
+			// shared memory 更新完毕
+
+			// 更新 loops 0 中计算值
+			// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
+			// 此时 loops 还是 0
+			for (int j = 0; j < min(32, inner_toDo); j++)
+			{
+				// Keep track of current Gaussian ID. Skip, if this one
+				// is behind the last contributor for this pixel.
+				float2 xy;
+				float2 d;
+				float4 con_o;
+				float power;
+				float G;
+				float alpha;
+				float dchannel_dcolor;
+				float dL_dalpha;
+
+				float bg_dot_dpixel;   
+				float dL_dchannel;     
+				float c;           
+
+				float dL_dG;         
+				float gdx;
+				float gdy;
+				float dG_ddelx;
+				float dG_ddely;                                                                                                                                                                                         
+
+				shuffle_dmean2D_x = 0.0f;
+				shuffle_dmean2D_y = 0.0f;
+				shuffle_dconic2D_x = 0.0f;
+				shuffle_dconic2D_y = 0.0f;
+				shuffle_dconic2D_w = 0.0f;
+				shuffle_dopacity = 0.0f;
+				shuffle_dcolor_x = 0.0f;
+				shuffle_dcolor_y = 0.0f;
+				shuffle_dcolor_z = 0.0f;
+				flag = false;
+				
+				if (!done) {
+					contributor--;
+					if (contributor < last_contributor) {
+						// Compute blending values, as before.
+						xy = collected_xy[loops * 32 + j];
+						d = { xy.x - pixf.x, xy.y - pixf.y };
+						con_o = collected_conic_opacity[loops * 32 + j];
+						power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+						if (power <= 0.0f) {
+							G = exp(power);
+							alpha = min(ALPHA_LIMIT, con_o.w * G);
+							if (alpha >= ALPHA_THRESHOLD) {
+								flag = true;
+				
+								T = T / (1.f - alpha);
+								dchannel_dcolor = alpha * T;
+
+								// Propagate gradients to per-Gaussian colors and keep
+								// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+								// pair).
+								dL_dalpha = 0.0f;
+								// const int global_id = collected_id[j];
+								for (int ch = 0; ch < C; ch++)
+								{
+									c = collected_colors[ch * BLOCK_SIZE + loops * 32 + j];
+									// Update last color (to be used in the next iteration)
+									accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+									last_color[ch] = c;
+
+									dL_dchannel = dL_dpixel[ch];
+									dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+									// Update the gradients w.r.t. color of the Gaussian. 
+									// Atomic, since this pixel is just one of potentially
+									// many that were affected by this Gaussian.
+									if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
+									else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
+									else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
+									// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+								}
+								dL_dalpha *= T;
+								// Update last alpha (to be used in the next iteration)
+								last_alpha = alpha;
+
+								// Account for fact that alpha also influences how much of
+								// the background color is added if nothing left to blend
+								bg_dot_dpixel = 0;
+								for (int i = 0; i < C; i++)
+									bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+								dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+
+								// Helpful reusable temporary variables
+								dL_dG = con_o.w * dL_dalpha;
+								gdx = G * d.x;
+								gdy = G * d.y;
+								dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+								dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+								shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
+								shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
+								shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
+								shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
+								shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
+								shuffle_dopacity = G * dL_dalpha;
 							}
-							dL_dalpha *= T;
-							// Update last alpha (to be used in the next iteration)
-							last_alpha = alpha;
-
-							// Account for fact that alpha also influences how much of
-							// the background color is added if nothing left to blend
-							bg_dot_dpixel = 0;
-							for (int i = 0; i < C; i++)
-								bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-							dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
-
-
-							// Helpful reusable temporary variables
-							dL_dG = con_o.w * dL_dalpha;
-							gdx = G * d.x;
-							gdy = G * d.y;
-							dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-							dG_ddely = -gdy * con_o.z - gdx * con_o.y;
-
-							shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
-							shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
-							shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
-							shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
-							shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
-							shuffle_dopacity = G * dL_dalpha;
 						}
 					}
 				}
-			}
-			// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
-			if (__any_sync(0xffffffff, flag == true)) {
-				shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
-				shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
-				shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
-				
-				shuffle_dmean2D_x = warpReduceSum<WARPSIZE>(shuffle_dmean2D_x);
-				shuffle_dmean2D_y = warpReduceSum<WARPSIZE>(shuffle_dmean2D_y);
+				// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
+				if (__any_sync(0xffffffff, flag == true)) {
+					shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
+					shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
+					shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
+					
+					shuffle_dmean2D_x = warpReduceSum<WARPSIZE>(shuffle_dmean2D_x);
+					shuffle_dmean2D_y = warpReduceSum<WARPSIZE>(shuffle_dmean2D_y);
 
-				shuffle_dconic2D_x = warpReduceSum<WARPSIZE>(shuffle_dconic2D_x);
-				shuffle_dconic2D_y = warpReduceSum<WARPSIZE>(shuffle_dconic2D_y);
-				shuffle_dconic2D_w = warpReduceSum<WARPSIZE>(shuffle_dconic2D_w);
+					shuffle_dconic2D_x = warpReduceSum<WARPSIZE>(shuffle_dconic2D_x);
+					shuffle_dconic2D_y = warpReduceSum<WARPSIZE>(shuffle_dconic2D_y);
+					shuffle_dconic2D_w = warpReduceSum<WARPSIZE>(shuffle_dconic2D_w);
 
-				shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
+					shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
 
-				const int idx = j * 8 + warp_id;
-				// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
-				if (lane_id == 0) {
+					const int idx = j * 8 + warp_id;
+					// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
+					if (lane_id == 0) {
 
-					collected_dL_dcolors[double_buffer_flag ^ 1][idx * C + 0] = shuffle_dcolor_x;
-					collected_dL_dcolors[double_buffer_flag ^ 1][idx * C + 1] = shuffle_dcolor_y;
-					collected_dL_dcolors[double_buffer_flag ^ 1][idx * C + 2] = shuffle_dcolor_z;
+						collected_dL_dcolors[tribble_buffer[0]][idx * C + 0] = shuffle_dcolor_x;
+						collected_dL_dcolors[tribble_buffer[0]][idx * C + 1] = shuffle_dcolor_y;
+						collected_dL_dcolors[tribble_buffer[0]][idx * C + 2] = shuffle_dcolor_z;
 
-					collected_dL_dmeans2D[double_buffer_flag ^ 1][idx].x = shuffle_dmean2D_x;
-					collected_dL_dmeans2D[double_buffer_flag ^ 1][idx].y = shuffle_dmean2D_y;
+						collected_dL_dmeans2D[tribble_buffer[0]][idx].x = shuffle_dmean2D_x;
+						collected_dL_dmeans2D[tribble_buffer[0]][idx].y = shuffle_dmean2D_y;
 
-					collected_dL_dconic2D[double_buffer_flag ^ 1][idx].x = shuffle_dconic2D_x;
-					collected_dL_dconic2D[double_buffer_flag ^ 1][idx].y = shuffle_dconic2D_y;
-					collected_dL_dconic2D[double_buffer_flag ^ 1][idx].w = shuffle_dconic2D_w;
-	
-					collected_dL_dopacity[double_buffer_flag ^ 1][idx] = shuffle_dopacity;
+						collected_dL_dconic2D[tribble_buffer[0]][idx].x = shuffle_dconic2D_x;
+						collected_dL_dconic2D[tribble_buffer[0]][idx].y = shuffle_dconic2D_y;
+						collected_dL_dconic2D[tribble_buffer[0]][idx].w = shuffle_dconic2D_w;
+		
+						collected_dL_dopacity[tribble_buffer[0]][idx] = shuffle_dopacity;
+					}
 				}
 			}
-		}
 
-		// shared 上同步 32 个高斯球的梯度已经完成了更新
-		// 循环中处理的应该是前一个 loops 中的值 loops - 1			
-		// 从 shared memory 中读数, 做累加
-		inner_toDo += 32;
-		if (block.thread_rank() < min(32, inner_toDo)) {
-			// 之后优化做合并访存 float4
-			// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
-			// coll_id 需要重新处理一下
-			const int coll_id = collected_id[(loops - 1) * 32 + block.thread_rank()];
-			float dL_dmean2D_x = 0.f;
-			float dL_dmean2D_y = 0.f;
-			float dL_dconic2D_x = 0.f;
-			float dL_dconic2D_y = 0.f;
-			float dL_dconic2D_w = 0.f;
-			float dL_dopacity_it = 0.f;
-			float dL_dcolors_r = 0.f;
-			float dL_dcolors_g = 0.f;
-			float dL_dcolors_b = 0.f;
+			// 将循环中的值进行更新
+			inner_toDo -= 64;
+			loops+=2;
 
-			// TODO 此处可以再做 float 访存
-			for (int index = 0; index < 8; index++) {
-				const int idx = block.thread_rank() * 8 + index;
-				dL_dmean2D_x += collected_dL_dmeans2D[double_buffer_flag][idx].x;
-				dL_dmean2D_y += collected_dL_dmeans2D[double_buffer_flag][idx].y;
+			for (; loops < inner_rounds; loops++, inner_toDo -= 32) {
 
-				dL_dconic2D_x += collected_dL_dconic2D[double_buffer_flag][idx].x;
-				dL_dconic2D_y += collected_dL_dconic2D[double_buffer_flag][idx].y;
-				dL_dconic2D_w += collected_dL_dconic2D[double_buffer_flag][idx].w;
+			block.sync();
+
+			// shared memory dL 更新值
+			for (int ch = 0; ch < C; ch++) {
+				collected_dL_dcolors[tribble_buffer[2]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+			}
+			
+			collected_dL_dconic2D[tribble_buffer[2]][block.thread_rank()].x = 0.0f;
+			collected_dL_dconic2D[tribble_buffer[2]][block.thread_rank()].y = 0.0f;
+			collected_dL_dconic2D[tribble_buffer[2]][block.thread_rank()].w = 0.0f;
+			
+			collected_dL_dmeans2D[tribble_buffer[2]][block.thread_rank()] = float2{0.0f, 0.0f};
+
+			collected_dL_dopacity[tribble_buffer[2]][block.thread_rank()] = 0.0f;
+			// shared memory 更新完毕
+
+			inner_toDo += 32;
+			// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
+			for (int j = 0; j < min(32, inner_toDo); j++)
+			{
+				// Keep track of current Gaussian ID. Skip, if this one
+				// is behind the last contributor for this pixel.
+				float2 xy;
+				float2 d;
+				float4 con_o;
+				float power;
+				float G;
+				float alpha;
+				float dchannel_dcolor;
+				float dL_dalpha;
+
+				float bg_dot_dpixel;   
+				float dL_dchannel;     
+				float c;           
+
+				float dL_dG;         
+				float gdx;
+				float gdy;
+				float dG_ddelx;
+				float dG_ddely;                                                                                                                                                                                         
+
+				shuffle_dmean2D_x = 0.0f;
+				shuffle_dmean2D_y = 0.0f;
+				shuffle_dconic2D_x = 0.0f;
+				shuffle_dconic2D_y = 0.0f;
+				shuffle_dconic2D_w = 0.0f;
+				shuffle_dopacity = 0.0f;
+				shuffle_dcolor_x = 0.0f;
+				shuffle_dcolor_y = 0.0f;
+				shuffle_dcolor_z = 0.0f;
+				flag = false;
 				
-				dL_dopacity_it += collected_dL_dopacity[double_buffer_flag][idx];
+				if (!done) {
+					contributor--;
+					if (contributor < last_contributor) {
+						// Compute blending values, as before.
+						xy = collected_xy[(loops - 1) * 32 + j];
+						d = { xy.x - pixf.x, xy.y - pixf.y };
+						con_o = collected_conic_opacity[(loops - 1) * 32 + j];
+						power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+						if (power <= 0.0f) {
+							G = exp(power);
+							alpha = min(ALPHA_LIMIT, con_o.w * G);
+							if (alpha >= ALPHA_THRESHOLD) {
+								flag = true;
+				
+								T = T / (1.f - alpha);
+								dchannel_dcolor = alpha * T;
 
-				dL_dcolors_r += collected_dL_dcolors[double_buffer_flag][idx * C + 0];
-				dL_dcolors_g += collected_dL_dcolors[double_buffer_flag][idx * C + 1];
-				dL_dcolors_b += collected_dL_dcolors[double_buffer_flag][idx * C + 2];
+								// Propagate gradients to per-Gaussian colors and keep
+								// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+								// pair).
+								dL_dalpha = 0.0f;
+								// const int global_id = collected_id[j];
+								for (int ch = 0; ch < C; ch++)
+								{
+									c = collected_colors[ch * BLOCK_SIZE + (loops - 1) * 32 + j];
+									// Update last color (to be used in the next iteration)
+									accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+									last_color[ch] = c;
+
+									dL_dchannel = dL_dpixel[ch];
+									dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+									// Update the gradients w.r.t. color of the Gaussian. 
+									// Atomic, since this pixel is just one of potentially
+									// many that were affected by this Gaussian.
+									if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
+									else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
+									else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
+									// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+								}
+								dL_dalpha *= T;
+								// Update last alpha (to be used in the next iteration)
+								last_alpha = alpha;
+
+								// Account for fact that alpha also influences how much of
+								// the background color is added if nothing left to blend
+								bg_dot_dpixel = 0;
+								for (int i = 0; i < C; i++)
+									bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+								dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+
+								// Helpful reusable temporary variables
+								dL_dG = con_o.w * dL_dalpha;
+								gdx = G * d.x;
+								gdy = G * d.y;
+								dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+								dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+								shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
+								shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
+								shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
+								shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
+								shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
+								shuffle_dopacity = G * dL_dalpha;
+							}
+						}
+					}
+				}
+				// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
+				if (__any_sync(0xffffffff, flag == true)) {
+					shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
+					shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
+					shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
+					
+					shuffle_dmean2D_x = warpReduceSum<WARPSIZE>(shuffle_dmean2D_x);
+					shuffle_dmean2D_y = warpReduceSum<WARPSIZE>(shuffle_dmean2D_y);
+
+					shuffle_dconic2D_x = warpReduceSum<WARPSIZE>(shuffle_dconic2D_x);
+					shuffle_dconic2D_y = warpReduceSum<WARPSIZE>(shuffle_dconic2D_y);
+					shuffle_dconic2D_w = warpReduceSum<WARPSIZE>(shuffle_dconic2D_w);
+
+					shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
+
+					const int idx = j * 8 + warp_id;
+					// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
+					if (lane_id == 0) {
+
+						collected_dL_dcolors[tribble_buffer[1]][idx * C + 0] = shuffle_dcolor_x;
+						collected_dL_dcolors[tribble_buffer[1]][idx * C + 1] = shuffle_dcolor_y;
+						collected_dL_dcolors[tribble_buffer[1]][idx * C + 2] = shuffle_dcolor_z;
+
+						collected_dL_dmeans2D[tribble_buffer[1]][idx].x = shuffle_dmean2D_x;
+						collected_dL_dmeans2D[tribble_buffer[1]][idx].y = shuffle_dmean2D_y;
+
+						collected_dL_dconic2D[tribble_buffer[1]][idx].x = shuffle_dconic2D_x;
+						collected_dL_dconic2D[tribble_buffer[1]][idx].y = shuffle_dconic2D_y;
+						collected_dL_dconic2D[tribble_buffer[1]][idx].w = shuffle_dconic2D_w;
+		
+						collected_dL_dopacity[tribble_buffer[1]][idx] = shuffle_dopacity;
+					}
+				}
 			}
 
-			atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
-			atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
-			atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
-			atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
-			atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
-			atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
-			atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
-			atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
-			atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
-		}
-		inner_toDo -= 32;
-		double_buffer_flag ^= 1;
-		}
+			// shared 上同步 32 个高斯球的梯度已经完成了更新
+			// 循环中处理的应该是前两个 loops 中的值 loops - 2			
+			// 从 shared memory 中读数, 做累加
+			inner_toDo += 32;
+			if (block.thread_rank() < min(32, inner_toDo)) {
+				// 之后优化做合并访存 float4
+				// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
+				// coll_id 需要重新处理一下
+				const int coll_id = collected_id[(loops - 2) * 32 + block.thread_rank()];
+				float dL_dmean2D_x = 0.f;
+				float dL_dmean2D_y = 0.f;
+				float dL_dconic2D_x = 0.f;
+				float dL_dconic2D_y = 0.f;
+				float dL_dconic2D_w = 0.f;
+				float dL_dopacity_it = 0.f;
+				float dL_dcolors_r = 0.f;
+				float dL_dcolors_g = 0.f;
+				float dL_dcolors_b = 0.f;
 
-		block.sync();
-		inner_toDo += 32;
-		if (block.thread_rank() < min(32, inner_toDo)) {
-			// 之后优化做合并访存 float4
-			// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
-			// coll_id 需要重新处理一下
-			const int coll_id = collected_id[(loops - 1) * 32 + block.thread_rank()];
-			float dL_dmean2D_x = 0.f;
-			float dL_dmean2D_y = 0.f;
-			float dL_dconic2D_x = 0.f;
-			float dL_dconic2D_y = 0.f;
-			float dL_dconic2D_w = 0.f;
-			float dL_dopacity_it = 0.f;
-			float dL_dcolors_r = 0.f;
-			float dL_dcolors_g = 0.f;
-			float dL_dcolors_b = 0.f;
+				// TODO 此处可以再做 float 访存
+				for (int index = 0; index < 8; index++) {
+					const int idx = block.thread_rank() * 8 + index;
+					dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
+					dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
 
-			// TODO 此处可以再做 float 访存
-			for (int z = 0; z < 8; z++) {
-				const int idx = block.thread_rank() * 8 + z;
-				dL_dmean2D_x += collected_dL_dmeans2D[double_buffer_flag][idx].x;
-				dL_dmean2D_y += collected_dL_dmeans2D[double_buffer_flag][idx].y;
+					dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
+					dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
+					dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+					
+					dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
 
-				dL_dconic2D_x += collected_dL_dconic2D[double_buffer_flag][idx].x;
-				dL_dconic2D_y += collected_dL_dconic2D[double_buffer_flag][idx].y;
-				dL_dconic2D_w += collected_dL_dconic2D[double_buffer_flag][idx].w;
-				
-				dL_dopacity_it += collected_dL_dopacity[double_buffer_flag][idx];
+					dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
+					dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
+					dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+				}
 
-				dL_dcolors_r += collected_dL_dcolors[double_buffer_flag][idx * C + 0];
-				dL_dcolors_g += collected_dL_dcolors[double_buffer_flag][idx * C + 1];
-				dL_dcolors_b += collected_dL_dcolors[double_buffer_flag][idx * C + 2];
+				atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
+				atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
+				atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
+				atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
+				atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
+				atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
+				atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
+				atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
+				atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
+			}
+			inner_toDo -= 64;
+			int temp = tribble_buffer[0];
+			tribble_buffer[0] = tribble_buffer[1];
+			tribble_buffer[1] = tribble_buffer[2];
+			tribble_buffer[2] = temp;
 			}
 
-			atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
-			atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
-			atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
-			atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
-			atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
-			atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
-			atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
-			atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
-			atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
+			// last2 loops
+			block.sync();
+			
+			inner_toDo += 32;
+			// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
+			for (int j = 0; j < min(32, inner_toDo); j++)
+			{
+				// Keep track of current Gaussian ID. Skip, if this one
+				// is behind the last contributor for this pixel.
+				float2 xy;
+				float2 d;
+				float4 con_o;
+				float power;
+				float G;
+				float alpha;
+				float dchannel_dcolor;
+				float dL_dalpha;
+
+				float bg_dot_dpixel;   
+				float dL_dchannel;     
+				float c;           
+
+				float dL_dG;         
+				float gdx;
+				float gdy;
+				float dG_ddelx;
+				float dG_ddely;                                                                                                                                                                                         
+
+				shuffle_dmean2D_x = 0.0f;
+				shuffle_dmean2D_y = 0.0f;
+				shuffle_dconic2D_x = 0.0f;
+				shuffle_dconic2D_y = 0.0f;
+				shuffle_dconic2D_w = 0.0f;
+				shuffle_dopacity = 0.0f;
+				shuffle_dcolor_x = 0.0f;
+				shuffle_dcolor_y = 0.0f;
+				shuffle_dcolor_z = 0.0f;
+				flag = false;
+				
+				if (!done) {
+					contributor--;
+					if (contributor < last_contributor) {
+						// Compute blending values, as before.
+						xy = collected_xy[(loops - 1) * 32 + j];
+						d = { xy.x - pixf.x, xy.y - pixf.y };
+						con_o = collected_conic_opacity[(loops - 1) * 32 + j];
+						power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+						if (power <= 0.0f) {
+							G = exp(power);
+							alpha = min(ALPHA_LIMIT, con_o.w * G);
+							if (alpha >= ALPHA_THRESHOLD) {
+								flag = true;
+				
+								T = T / (1.f - alpha);
+								dchannel_dcolor = alpha * T;
+
+								// Propagate gradients to per-Gaussian colors and keep
+								// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+								// pair).
+								dL_dalpha = 0.0f;
+								// const int global_id = collected_id[j];
+								for (int ch = 0; ch < C; ch++)
+								{
+									c = collected_colors[ch * BLOCK_SIZE + (loops - 1) * 32 + j];
+									// Update last color (to be used in the next iteration)
+									accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+									last_color[ch] = c;
+
+									dL_dchannel = dL_dpixel[ch];
+									dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+									// Update the gradients w.r.t. color of the Gaussian. 
+									// Atomic, since this pixel is just one of potentially
+									// many that were affected by this Gaussian.
+									if (ch == 0)		shuffle_dcolor_x = dchannel_dcolor * dL_dchannel;
+									else if (ch == 1)	shuffle_dcolor_y = dchannel_dcolor * dL_dchannel;
+									else 				shuffle_dcolor_z = dchannel_dcolor * dL_dchannel;
+									// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+								}
+								dL_dalpha *= T;
+								// Update last alpha (to be used in the next iteration)
+								last_alpha = alpha;
+
+								// Account for fact that alpha also influences how much of
+								// the background color is added if nothing left to blend
+								bg_dot_dpixel = 0;
+								for (int i = 0; i < C; i++)
+									bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+								dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+
+								// Helpful reusable temporary variables
+								dL_dG = con_o.w * dL_dalpha;
+								gdx = G * d.x;
+								gdy = G * d.y;
+								dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+								dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+								shuffle_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
+								shuffle_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
+								shuffle_dconic2D_x = -0.5f * gdx * d.x * dL_dG;
+								shuffle_dconic2D_y = -0.5f * gdx * d.y * dL_dG;
+								shuffle_dconic2D_w = -0.5f * gdy * d.y * dL_dG;
+								shuffle_dopacity = G * dL_dalpha;
+							}
+						}
+					}
+				}
+				// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
+				if (__any_sync(0xffffffff, flag == true)) {
+					shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
+					shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
+					shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
+					
+					shuffle_dmean2D_x = warpReduceSum<WARPSIZE>(shuffle_dmean2D_x);
+					shuffle_dmean2D_y = warpReduceSum<WARPSIZE>(shuffle_dmean2D_y);
+
+					shuffle_dconic2D_x = warpReduceSum<WARPSIZE>(shuffle_dconic2D_x);
+					shuffle_dconic2D_y = warpReduceSum<WARPSIZE>(shuffle_dconic2D_y);
+					shuffle_dconic2D_w = warpReduceSum<WARPSIZE>(shuffle_dconic2D_w);
+
+					shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
+
+					const int idx = j * 8 + warp_id;
+					// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
+					if (lane_id == 0) {
+
+						collected_dL_dcolors[tribble_buffer[1]][idx * C + 0] = shuffle_dcolor_x;
+						collected_dL_dcolors[tribble_buffer[1]][idx * C + 1] = shuffle_dcolor_y;
+						collected_dL_dcolors[tribble_buffer[1]][idx * C + 2] = shuffle_dcolor_z;
+
+						collected_dL_dmeans2D[tribble_buffer[1]][idx].x = shuffle_dmean2D_x;
+						collected_dL_dmeans2D[tribble_buffer[1]][idx].y = shuffle_dmean2D_y;
+
+						collected_dL_dconic2D[tribble_buffer[1]][idx].x = shuffle_dconic2D_x;
+						collected_dL_dconic2D[tribble_buffer[1]][idx].y = shuffle_dconic2D_y;
+						collected_dL_dconic2D[tribble_buffer[1]][idx].w = shuffle_dconic2D_w;
+		
+						collected_dL_dopacity[tribble_buffer[1]][idx] = shuffle_dopacity;
+					}
+				}
+			}
+
+			inner_toDo += 32;
+			if (block.thread_rank() < min(32, inner_toDo)) {
+				// 之后优化做合并访存 float4
+				// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
+				// coll_id 需要重新处理一下
+				const int coll_id = collected_id[(loops - 2) * 32 + block.thread_rank()];
+				float dL_dmean2D_x = 0.f;
+				float dL_dmean2D_y = 0.f;
+				float dL_dconic2D_x = 0.f;
+				float dL_dconic2D_y = 0.f;
+				float dL_dconic2D_w = 0.f;
+				float dL_dopacity_it = 0.f;
+				float dL_dcolors_r = 0.f;
+				float dL_dcolors_g = 0.f;
+				float dL_dcolors_b = 0.f;
+
+				// TODO 此处可以再做 float 访存
+				for (int z = 0; z < 8; z++) {
+					const int idx = block.thread_rank() * 8 + z;
+					dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
+					dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
+
+					dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
+					dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
+					dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+					
+					dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
+
+					dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
+					dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
+					dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+				}
+
+				atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
+				atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
+				atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
+				atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
+				atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
+				atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
+				atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
+				atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
+				atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
+			}
+
+			block.sync();
+
+			inner_toDo -= 32;
+			int temp = tribble_buffer[0];
+			tribble_buffer[0] = tribble_buffer[1];
+			tribble_buffer[1] = tribble_buffer[2];
+			tribble_buffer[2] = temp;
+			if (block.thread_rank() < min(32, inner_toDo)) {
+				// 之后优化做合并访存 float4
+				// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
+				// coll_id 需要重新处理一下
+				const int coll_id = collected_id[(loops - 1) * 32 + block.thread_rank()];
+				float dL_dmean2D_x = 0.f;
+				float dL_dmean2D_y = 0.f;
+				float dL_dconic2D_x = 0.f;
+				float dL_dconic2D_y = 0.f;
+				float dL_dconic2D_w = 0.f;
+				float dL_dopacity_it = 0.f;
+				float dL_dcolors_r = 0.f;
+				float dL_dcolors_g = 0.f;
+				float dL_dcolors_b = 0.f;
+
+				// TODO 此处可以再做 float 访存
+				for (int z = 0; z < 8; z++) {
+					const int idx = block.thread_rank() * 8 + z;
+					dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
+					dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
+
+					dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
+					dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
+					dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+					
+					dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
+
+					dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
+					dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
+					dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+				}
+
+				atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
+				atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
+				atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
+				atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
+				atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
+				atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
+				atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
+				atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
+				atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
+			}
 		}
 	}
 }
