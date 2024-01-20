@@ -928,8 +928,8 @@ renderCUDA(
 			float dL_dcolors_b = 0.f;
 
 			// TODO 此处可以再做 float 访存
-			for (int z = 0; z < 8; z++) {
-				const int idx = block.thread_rank() * 8 + z;
+			for (int index = 0; index < 8; index++) {
+				const int idx = block.thread_rank() * 8 + index;
 				dL_dmean2D_x += collected_dL_dmeans2D[double_buffer_flag][idx].x;
 				dL_dmean2D_y += collected_dL_dmeans2D[double_buffer_flag][idx].y;
 
