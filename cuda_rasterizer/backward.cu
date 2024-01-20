@@ -399,8 +399,6 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
-__constant__ float ALPHA_THRESHOLD = 1.0f / 255.0f;
-__constant__ float ALPHA_LIMIT = 0.99f;
 
 template <int size>
 __device__ __forceinline__ float warpReduceSum(float partial_sum) {
@@ -453,15 +451,12 @@ renderCUDA(
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
-	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint2 pix = { block.group_index().x * BLOCK_X + block.thread_index().x, block.group_index().y * BLOCK_Y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float2 pixf = { (float)pix.x, (float)pix.y };
 
 	const bool inside = pix.x < W&& pix.y < H;
-	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const uint2 range = ranges[block.group_index().y * gridDim.x + block.group_index().x];
 
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
@@ -610,8 +605,8 @@ renderCUDA(
 					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 					if (power <= 0.0f) {
 						G = exp(power);
-						alpha = min(ALPHA_LIMIT, con_o.w * G);
-						if (alpha >= ALPHA_THRESHOLD) {
+						alpha = min(0.99f, con_o.w * G);
+						if (alpha >= 1.0f / 255.0f) {
 							flag = true;
 			
 							T = T / (1.f - alpha);
@@ -772,8 +767,8 @@ renderCUDA(
 					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 					if (power <= 0.0f) {
 						G = exp(power);
-						alpha = min(ALPHA_LIMIT, con_o.w * G);
-						if (alpha >= ALPHA_THRESHOLD) {
+						alpha = min(0.99f, con_o.w * G);
+						if (alpha >= 1.0f / 255.0f) {
 							flag = true;
 			
 							T = T / (1.f - alpha);
