@@ -428,6 +428,10 @@ template <>
 __device__ __forceinline__ void copy_vector<float, 4>(float *dst, float *src) {
 	*(reinterpret_cast<float4*>(dst)) = *(reinterpret_cast<float4*>(src));
 }
+
+__constant__ float ALPHA_LIMIT = 0.99f;
+__constant__ float ALPHA_THRESHOLD = 1.0f / 255.0f;
+
 // smoke test shows that three software pipeline accelerate 
 // ToDo: buffer three
 // Backward version of the rendering procedure.
@@ -543,7 +547,7 @@ renderCUDA(
 		// loops 内循环次数, 内循环被拆分成 32 个高斯球
 		const int inner_rounds = (max_gaussian_inner + 32 - 1) / 32;
 
-		int tribble_buffer[3] = {0, 1, 2};
+		int tribble_buffer = 0;
 		int loops = 0;
 
 		if (inner_rounds == 1 || inner_rounds == 2) {
@@ -553,16 +557,16 @@ renderCUDA(
 
 				// shared memory dL 更新值
 				for (int ch = 0; ch < C; ch++) {
-					collected_dL_dcolors[tribble_buffer[0]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+					collected_dL_dcolors[tribble_buffer][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
 				}
 				
-				collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].x = 0.0f;
-				collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].y = 0.0f;
-				collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].w = 0.0f;
+				collected_dL_dconic2D[tribble_buffer][block.thread_rank()].x = 0.0f;
+				collected_dL_dconic2D[tribble_buffer][block.thread_rank()].y = 0.0f;
+				collected_dL_dconic2D[tribble_buffer][block.thread_rank()].w = 0.0f;
 				
-				collected_dL_dmeans2D[tribble_buffer[0]][block.thread_rank()] = float2{0.0f, 0.0f};
+				collected_dL_dmeans2D[tribble_buffer][block.thread_rank()] = float2{0.0f, 0.0f};
 
-				collected_dL_dopacity[tribble_buffer[0]][block.thread_rank()] = 0.0f;
+				collected_dL_dopacity[tribble_buffer][block.thread_rank()] = 0.0f;
 				// shared memory 更新完毕
 
 				block.sync();
@@ -692,19 +696,19 @@ renderCUDA(
 						// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
 						if (lane_id == 0) {
 
-							collected_dL_dcolors[tribble_buffer[0]][idx * C + 0] = shuffle_dcolor_x;
-							collected_dL_dcolors[tribble_buffer[0]][idx * C + 1] = shuffle_dcolor_y;
-							collected_dL_dcolors[tribble_buffer[0]][idx * C + 2] = shuffle_dcolor_z;
+							collected_dL_dcolors[tribble_buffer][idx * C + 0] = shuffle_dcolor_x;
+							collected_dL_dcolors[tribble_buffer][idx * C + 1] = shuffle_dcolor_y;
+							collected_dL_dcolors[tribble_buffer][idx * C + 2] = shuffle_dcolor_z;
 
-							collected_dL_dmeans2D[tribble_buffer[0]][idx].x = shuffle_dmean2D_x;
-							collected_dL_dmeans2D[tribble_buffer[0]][idx].y = shuffle_dmean2D_y;
+							collected_dL_dmeans2D[tribble_buffer][idx].x = shuffle_dmean2D_x;
+							collected_dL_dmeans2D[tribble_buffer][idx].y = shuffle_dmean2D_y;
 
-							collected_dL_dconic2D[tribble_buffer[0]][idx].x = shuffle_dconic2D_x;
-							collected_dL_dconic2D[tribble_buffer[0]][idx].y = shuffle_dconic2D_y;
-							collected_dL_dconic2D[tribble_buffer[0]][idx].w = shuffle_dconic2D_w;
+							collected_dL_dconic2D[tribble_buffer][idx].x = shuffle_dconic2D_x;
+							collected_dL_dconic2D[tribble_buffer][idx].y = shuffle_dconic2D_y;
+							collected_dL_dconic2D[tribble_buffer][idx].w = shuffle_dconic2D_w;
 			
 
-							collected_dL_dopacity[tribble_buffer[0]][idx] = shuffle_dopacity;
+							collected_dL_dopacity[tribble_buffer][idx] = shuffle_dopacity;
 						}
 					}
 				}
@@ -731,18 +735,18 @@ renderCUDA(
 					// TODO 此处可以再做 float 访存
 					for (int z = 0; z < 8; z++) {
 						const int idx = block.thread_rank() * 8 + z;
-						dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
-						dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
+						dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer][idx].x;
+						dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer][idx].y;
 
-						dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
-						dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
-						dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+						dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer][idx].x;
+						dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer][idx].y;
+						dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer][idx].w;
 						
-						dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
+						dL_dopacity_it += collected_dL_dopacity[tribble_buffer][idx];
 
-						dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
-						dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
-						dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+						dL_dcolors_r += collected_dL_dcolors[tribble_buffer][idx * C + 0];
+						dL_dcolors_g += collected_dL_dcolors[tribble_buffer][idx * C + 1];
+						dL_dcolors_b += collected_dL_dcolors[tribble_buffer][idx * C + 2];
 					}
 
 					atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
@@ -763,31 +767,31 @@ renderCUDA(
 
 			// shared memory dL 更新值
 			for (int ch = 0; ch < C; ch++) {
-				collected_dL_dcolors[tribble_buffer[0]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+				collected_dL_dcolors[tribble_buffer][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
 			}
 			
-			collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].x = 0.0f;
-			collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].y = 0.0f;
-			collected_dL_dconic2D[tribble_buffer[0]][block.thread_rank()].w = 0.0f;
+			collected_dL_dconic2D[tribble_buffer][block.thread_rank()].x = 0.0f;
+			collected_dL_dconic2D[tribble_buffer][block.thread_rank()].y = 0.0f;
+			collected_dL_dconic2D[tribble_buffer][block.thread_rank()].w = 0.0f;
 			
-			collected_dL_dmeans2D[tribble_buffer[0]][block.thread_rank()] = float2{0.0f, 0.0f};
+			collected_dL_dmeans2D[tribble_buffer][block.thread_rank()] = float2{0.0f, 0.0f};
 
-			collected_dL_dopacity[tribble_buffer[0]][block.thread_rank()] = 0.0f;
+			collected_dL_dopacity[tribble_buffer][block.thread_rank()] = 0.0f;
 			// shared memory 更新完毕
 			block.sync();
 
 			//  流水线  预取 2 
 			for (int ch = 0; ch < C; ch++) {
-				collected_dL_dcolors[tribble_buffer[1]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+				collected_dL_dcolors[tribble_buffer + 1][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
 			}
 			
-			collected_dL_dconic2D[tribble_buffer[1]][block.thread_rank()].x = 0.0f;
-			collected_dL_dconic2D[tribble_buffer[1]][block.thread_rank()].y = 0.0f;
-			collected_dL_dconic2D[tribble_buffer[1]][block.thread_rank()].w = 0.0f;
+			collected_dL_dconic2D[tribble_buffer + 1][block.thread_rank()].x = 0.0f;
+			collected_dL_dconic2D[tribble_buffer + 1][block.thread_rank()].y = 0.0f;
+			collected_dL_dconic2D[tribble_buffer + 1][block.thread_rank()].w = 0.0f;
 			
-			collected_dL_dmeans2D[tribble_buffer[1]][block.thread_rank()] = float2{0.0f, 0.0f};
+			collected_dL_dmeans2D[tribble_buffer + 1][block.thread_rank()] = float2{0.0f, 0.0f};
 
-			collected_dL_dopacity[tribble_buffer[1]][block.thread_rank()] = 0.0f;
+			collected_dL_dopacity[tribble_buffer + 1][block.thread_rank()] = 0.0f;
 			// shared memory 更新完毕
 
 			// 更新 loops 0 中计算值
@@ -914,18 +918,18 @@ renderCUDA(
 					// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
 					if (lane_id == 0) {
 
-						collected_dL_dcolors[tribble_buffer[0]][idx * C + 0] = shuffle_dcolor_x;
-						collected_dL_dcolors[tribble_buffer[0]][idx * C + 1] = shuffle_dcolor_y;
-						collected_dL_dcolors[tribble_buffer[0]][idx * C + 2] = shuffle_dcolor_z;
+						collected_dL_dcolors[tribble_buffer][idx * C + 0] = shuffle_dcolor_x;
+						collected_dL_dcolors[tribble_buffer][idx * C + 1] = shuffle_dcolor_y;
+						collected_dL_dcolors[tribble_buffer][idx * C + 2] = shuffle_dcolor_z;
 
-						collected_dL_dmeans2D[tribble_buffer[0]][idx].x = shuffle_dmean2D_x;
-						collected_dL_dmeans2D[tribble_buffer[0]][idx].y = shuffle_dmean2D_y;
+						collected_dL_dmeans2D[tribble_buffer][idx].x = shuffle_dmean2D_x;
+						collected_dL_dmeans2D[tribble_buffer][idx].y = shuffle_dmean2D_y;
 
-						collected_dL_dconic2D[tribble_buffer[0]][idx].x = shuffle_dconic2D_x;
-						collected_dL_dconic2D[tribble_buffer[0]][idx].y = shuffle_dconic2D_y;
-						collected_dL_dconic2D[tribble_buffer[0]][idx].w = shuffle_dconic2D_w;
+						collected_dL_dconic2D[tribble_buffer][idx].x = shuffle_dconic2D_x;
+						collected_dL_dconic2D[tribble_buffer][idx].y = shuffle_dconic2D_y;
+						collected_dL_dconic2D[tribble_buffer][idx].w = shuffle_dconic2D_w;
 		
-						collected_dL_dopacity[tribble_buffer[0]][idx] = shuffle_dopacity;
+						collected_dL_dopacity[tribble_buffer][idx] = shuffle_dopacity;
 					}
 				}
 			}
@@ -937,19 +941,20 @@ renderCUDA(
 			for (; loops < inner_rounds; loops++, inner_toDo -= 32) {
 
 			block.sync();
-
+			
+			int test1 = (tribble_buffer + 2) % 3;
 			// shared memory dL 更新值
 			for (int ch = 0; ch < C; ch++) {
-				collected_dL_dcolors[tribble_buffer[2]][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+				collected_dL_dcolors[test1][ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
 			}
 			
-			collected_dL_dconic2D[tribble_buffer[2]][block.thread_rank()].x = 0.0f;
-			collected_dL_dconic2D[tribble_buffer[2]][block.thread_rank()].y = 0.0f;
-			collected_dL_dconic2D[tribble_buffer[2]][block.thread_rank()].w = 0.0f;
+			collected_dL_dconic2D[test1][block.thread_rank()].x = 0.0f;
+			collected_dL_dconic2D[test1][block.thread_rank()].y = 0.0f;
+			collected_dL_dconic2D[test1][block.thread_rank()].w = 0.0f;
 			
-			collected_dL_dmeans2D[tribble_buffer[2]][block.thread_rank()] = float2{0.0f, 0.0f};
+			collected_dL_dmeans2D[test1][block.thread_rank()] = float2{0.0f, 0.0f};
 
-			collected_dL_dopacity[tribble_buffer[2]][block.thread_rank()] = 0.0f;
+			collected_dL_dopacity[test1][block.thread_rank()] = 0.0f;
 			// shared memory 更新完毕
 
 			inner_toDo += 32;
@@ -1074,19 +1079,19 @@ renderCUDA(
 					const int idx = j * 8 + warp_id;
 					// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
 					if (lane_id == 0) {
+						int test2 = (tribble_buffer + 1) % 3;
+						collected_dL_dcolors[test2][idx * C + 0] = shuffle_dcolor_x;
+						collected_dL_dcolors[test2][idx * C + 1] = shuffle_dcolor_y;
+						collected_dL_dcolors[test2][idx * C + 2] = shuffle_dcolor_z;
 
-						collected_dL_dcolors[tribble_buffer[1]][idx * C + 0] = shuffle_dcolor_x;
-						collected_dL_dcolors[tribble_buffer[1]][idx * C + 1] = shuffle_dcolor_y;
-						collected_dL_dcolors[tribble_buffer[1]][idx * C + 2] = shuffle_dcolor_z;
+						collected_dL_dmeans2D[test2][idx].x = shuffle_dmean2D_x;
+						collected_dL_dmeans2D[test2][idx].y = shuffle_dmean2D_y;
 
-						collected_dL_dmeans2D[tribble_buffer[1]][idx].x = shuffle_dmean2D_x;
-						collected_dL_dmeans2D[tribble_buffer[1]][idx].y = shuffle_dmean2D_y;
-
-						collected_dL_dconic2D[tribble_buffer[1]][idx].x = shuffle_dconic2D_x;
-						collected_dL_dconic2D[tribble_buffer[1]][idx].y = shuffle_dconic2D_y;
-						collected_dL_dconic2D[tribble_buffer[1]][idx].w = shuffle_dconic2D_w;
+						collected_dL_dconic2D[test2][idx].x = shuffle_dconic2D_x;
+						collected_dL_dconic2D[test2][idx].y = shuffle_dconic2D_y;
+						collected_dL_dconic2D[test2][idx].w = shuffle_dconic2D_w;
 		
-						collected_dL_dopacity[tribble_buffer[1]][idx] = shuffle_dopacity;
+						collected_dL_dopacity[test2][idx] = shuffle_dopacity;
 					}
 				}
 			}
@@ -1112,19 +1117,20 @@ renderCUDA(
 
 				// TODO 此处可以再做 float 访存
 				for (int index = 0; index < 8; index++) {
+					int test3 = tribble_buffer;
 					const int idx = block.thread_rank() * 8 + index;
-					dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
-					dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
+					dL_dmean2D_x += collected_dL_dmeans2D[test3][idx].x;
+					dL_dmean2D_y += collected_dL_dmeans2D[test3][idx].y;
 
-					dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
-					dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
-					dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+					dL_dconic2D_x += collected_dL_dconic2D[test3][idx].x;
+					dL_dconic2D_y += collected_dL_dconic2D[test3][idx].y;
+					dL_dconic2D_w += collected_dL_dconic2D[test3][idx].w;
 					
-					dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
+					dL_dopacity_it += collected_dL_dopacity[test3][idx];
 
-					dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
-					dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
-					dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+					dL_dcolors_r += collected_dL_dcolors[test3][idx * C + 0];
+					dL_dcolors_g += collected_dL_dcolors[test3][idx * C + 1];
+					dL_dcolors_b += collected_dL_dcolors[test3][idx * C + 2];
 				}
 
 				atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
@@ -1138,10 +1144,7 @@ renderCUDA(
 				atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
 			}
 			inner_toDo -= 64;
-			int temp = tribble_buffer[0];
-			tribble_buffer[0] = tribble_buffer[1];
-			tribble_buffer[1] = tribble_buffer[2];
-			tribble_buffer[2] = temp;
+			tribble_buffer = (tribble_buffer + 1) % 3;
 			}
 
 			// last2 loops
@@ -1269,19 +1272,19 @@ renderCUDA(
 					const int idx = j * 8 + warp_id;
 					// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
 					if (lane_id == 0) {
+						int test2 = (tribble_buffer + 1) % 3;
+						collected_dL_dcolors[test2][idx * C + 0] = shuffle_dcolor_x;
+						collected_dL_dcolors[test2][idx * C + 1] = shuffle_dcolor_y;
+						collected_dL_dcolors[test2][idx * C + 2] = shuffle_dcolor_z;
 
-						collected_dL_dcolors[tribble_buffer[1]][idx * C + 0] = shuffle_dcolor_x;
-						collected_dL_dcolors[tribble_buffer[1]][idx * C + 1] = shuffle_dcolor_y;
-						collected_dL_dcolors[tribble_buffer[1]][idx * C + 2] = shuffle_dcolor_z;
+						collected_dL_dmeans2D[test2][idx].x = shuffle_dmean2D_x;
+						collected_dL_dmeans2D[test2][idx].y = shuffle_dmean2D_y;
 
-						collected_dL_dmeans2D[tribble_buffer[1]][idx].x = shuffle_dmean2D_x;
-						collected_dL_dmeans2D[tribble_buffer[1]][idx].y = shuffle_dmean2D_y;
-
-						collected_dL_dconic2D[tribble_buffer[1]][idx].x = shuffle_dconic2D_x;
-						collected_dL_dconic2D[tribble_buffer[1]][idx].y = shuffle_dconic2D_y;
-						collected_dL_dconic2D[tribble_buffer[1]][idx].w = shuffle_dconic2D_w;
+						collected_dL_dconic2D[test2][idx].x = shuffle_dconic2D_x;
+						collected_dL_dconic2D[test2][idx].y = shuffle_dconic2D_y;
+						collected_dL_dconic2D[test2][idx].w = shuffle_dconic2D_w;
 		
-						collected_dL_dopacity[tribble_buffer[1]][idx] = shuffle_dopacity;
+						collected_dL_dopacity[test2][idx] = shuffle_dopacity;
 					}
 				}
 			}
@@ -1305,18 +1308,19 @@ renderCUDA(
 				// TODO 此处可以再做 float 访存
 				for (int z = 0; z < 8; z++) {
 					const int idx = block.thread_rank() * 8 + z;
-					dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
-					dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
+					int test3 = tribble_buffer;
+					dL_dmean2D_x += collected_dL_dmeans2D[test3][idx].x;
+					dL_dmean2D_y += collected_dL_dmeans2D[test3][idx].y;
 
-					dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
-					dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
-					dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+					dL_dconic2D_x += collected_dL_dconic2D[test3][idx].x;
+					dL_dconic2D_y += collected_dL_dconic2D[test3][idx].y;
+					dL_dconic2D_w += collected_dL_dconic2D[test3][idx].w;
 					
-					dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
+					dL_dopacity_it += collected_dL_dopacity[test3][idx];
 
-					dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
-					dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
-					dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+					dL_dcolors_r += collected_dL_dcolors[test3][idx * C + 0];
+					dL_dcolors_g += collected_dL_dcolors[test3][idx * C + 1];
+					dL_dcolors_b += collected_dL_dcolors[test3][idx * C + 2];
 				}
 
 				atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
@@ -1333,10 +1337,7 @@ renderCUDA(
 			block.sync();
 
 			inner_toDo -= 32;
-			int temp = tribble_buffer[0];
-			tribble_buffer[0] = tribble_buffer[1];
-			tribble_buffer[1] = tribble_buffer[2];
-			tribble_buffer[2] = temp;
+			tribble_buffer = (tribble_buffer + 1) % 3;
 			if (block.thread_rank() < min(32, inner_toDo)) {
 				// 之后优化做合并访存 float4
 				// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
@@ -1355,18 +1356,18 @@ renderCUDA(
 				// TODO 此处可以再做 float 访存
 				for (int z = 0; z < 8; z++) {
 					const int idx = block.thread_rank() * 8 + z;
-					dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer[0]][idx].x;
-					dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer[0]][idx].y;
+					dL_dmean2D_x += collected_dL_dmeans2D[tribble_buffer][idx].x;
+					dL_dmean2D_y += collected_dL_dmeans2D[tribble_buffer][idx].y;
 
-					dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer[0]][idx].x;
-					dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer[0]][idx].y;
-					dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer[0]][idx].w;
+					dL_dconic2D_x += collected_dL_dconic2D[tribble_buffer][idx].x;
+					dL_dconic2D_y += collected_dL_dconic2D[tribble_buffer][idx].y;
+					dL_dconic2D_w += collected_dL_dconic2D[tribble_buffer][idx].w;
 					
-					dL_dopacity_it += collected_dL_dopacity[tribble_buffer[0]][idx];
+					dL_dopacity_it += collected_dL_dopacity[tribble_buffer][idx];
 
-					dL_dcolors_r += collected_dL_dcolors[tribble_buffer[0]][idx * C + 0];
-					dL_dcolors_g += collected_dL_dcolors[tribble_buffer[0]][idx * C + 1];
-					dL_dcolors_b += collected_dL_dcolors[tribble_buffer[0]][idx * C + 2];
+					dL_dcolors_r += collected_dL_dcolors[tribble_buffer][idx * C + 0];
+					dL_dcolors_g += collected_dL_dcolors[tribble_buffer][idx * C + 1];
+					dL_dcolors_b += collected_dL_dcolors[tribble_buffer][idx * C + 2];
 				}
 
 				atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
