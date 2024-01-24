@@ -432,6 +432,7 @@ __device__ __forceinline__ void copy_vector<float, 4>(float *dst, float *src) {
 }
 
 // Backward version of the rendering procedure.
+// Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -474,7 +475,7 @@ renderCUDA(
 
 	__shared__ float collected_dL_dcolors[C * BLOCK_SIZE];
 	__shared__ float4 collected_dL_dconic2D[BLOCK_SIZE];
-	__shared__ float2 collected_dL_dmeans2D[BLOCK_SIZE];
+	__shared__ float2 colleted_dL_dmeans2D[BLOCK_SIZE];
 	__shared__ float collected_dL_dopacity[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
@@ -502,7 +503,6 @@ renderCUDA(
 	const float ddely_dy = 0.5 * H;
 
 	const int lane_id = block.thread_rank() & (WARPSIZE - 1);
-	const int warp_id = (block.thread_rank() >> 5);
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -510,7 +510,6 @@ renderCUDA(
 		// and load them in revers order.
 		block.sync();
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
-		// 注意这里可能是没有 256 个高斯球的，这里 collected 部分有一部分乱值
 		if (range.x + progress < range.y)
 		{
 			const int coll_id = point_list[range.y - progress - 1];
@@ -519,11 +518,39 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int ch = 0; ch < C; ch++) {
+				collected_dL_dcolors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+			}
+			
+			collected_dL_dconic2D[block.thread_rank()].x = 0.0f;
+			collected_dL_dconic2D[block.thread_rank()].y = 0.0f;
+			collected_dL_dconic2D[block.thread_rank()].w = 0.0f;
+			
+			colleted_dL_dmeans2D[block.thread_rank()] = float2{0.0f, 0.0f};
+
+			collected_dL_dopacity[block.thread_rank()] = 0.0f;
 		}
 		block.sync();
 
-		// Iterate over Gaussians
-		// shuffle 值初始化
+		float2 xy;
+		float2 d;
+		float4 con_o;
+		float power;
+		float G;
+		float alpha;
+		float dchannel_dcolor;
+		float dL_dalpha;
+
+		float bg_dot_dpixel;   
+		float dL_dchannel;     
+		float c;           
+
+		float dL_dG;         
+		float gdx;
+		float gdy;
+		float dG_ddelx;
+		float dG_ddely;     
+
 		float shuffle_dmean2D_x = 0.0f;
 		float shuffle_dmean2D_y = 0.0f;
 		float shuffle_dconic2D_x = 0.0f;
@@ -533,59 +560,17 @@ renderCUDA(
 		float shuffle_dcolor_x = 0.0f;
 		float shuffle_dcolor_y = 0.0f;
 		float shuffle_dcolor_z = 0.0f;
-		bool flag = true;		
 
-		// 内部循环 toDo 的 高斯球
-		int inner_toDo = toDo;
-		// 内部需要处理的高斯球的总数, 要么是 256 个, 要么是 inner 个
-		const int max_gaussian_inner = min(BLOCK_SIZE, inner_toDo);
-	
-		// loops 内循环次数, 内循环被拆分成 32 个高斯球
-		const int inner_rounds = (max_gaussian_inner + 32 - 1) / 32;
+		float flag = false;
 
-		for (int loops = 0; loops < inner_rounds; loops++, inner_toDo -= 32) {
-
-		block.sync();
-
-		// shared memory dL 更新值
-		for (int ch = 0; ch < C; ch++) {
-			collected_dL_dcolors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
-		}
-		
-		collected_dL_dconic2D[block.thread_rank()].x = 0.0f;
-		collected_dL_dconic2D[block.thread_rank()].y = 0.0f;
-		collected_dL_dconic2D[block.thread_rank()].w = 0.0f;
-		
-		collected_dL_dmeans2D[block.thread_rank()] = float2{0.0f, 0.0f};
-
-		collected_dL_dopacity[block.thread_rank()] = 0.0f;
-		// shared memory 更新完毕
-
-		block.sync();
-
-		// 一次更新 32 个高斯球的梯度 一个 j 循环更新 32 个高斯球
-		for (int j = 0; j < min(32, inner_toDo); j++)
+		// Iterate over Gaussians
+		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++)
 		{
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
-			float2 xy;
-			float2 d;
-			float4 con_o;
-			float power;
-			float G;
-			float alpha;
-			float dchannel_dcolor;
-			float dL_dalpha;
-
-			float bg_dot_dpixel;   
-			float dL_dchannel;     
-			float c;           
-
-			float dL_dG;         
-			float gdx;
-			float gdy;
-			float dG_ddelx;
-			float dG_ddely;                                                                                                                                                                                         
+			// Keep track of current Gaussian ID. Skip, if this one
+			// is behind the last contributor for this pixel.
+                                                                                                                                                                                    
 
 			shuffle_dmean2D_x = 0.0f;
 			shuffle_dmean2D_y = 0.0f;
@@ -602,14 +587,14 @@ renderCUDA(
 				contributor--;
 				if (contributor < last_contributor) {
 					// Compute blending values, as before.
-					xy = collected_xy[loops * 32 + j];
+					xy = collected_xy[j];
 					d = { xy.x - pixf.x, xy.y - pixf.y };
-					con_o = collected_conic_opacity[loops * 32 + j];
+					con_o = collected_conic_opacity[j];
 					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 					if (power <= 0.0f) {
 						G = exp(power);
-						alpha = min(ALPHA_LIMIT, con_o.w * G);
-						if (alpha >= ALPHA_THRESHOLD) {
+						alpha = min(0.99f, con_o.w * G);
+						if (alpha >= 1.0f / 255.0f) {
 							flag = true;
 			
 							T = T / (1.f - alpha);
@@ -622,7 +607,7 @@ renderCUDA(
 							// const int global_id = collected_id[j];
 							for (int ch = 0; ch < C; ch++)
 							{
-								c = collected_colors[ch * BLOCK_SIZE + loops * 32 + j];
+								c = collected_colors[ch * BLOCK_SIZE + j];
 								// Update last color (to be used in the next iteration)
 								accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 								last_color[ch] = c;
@@ -666,8 +651,9 @@ renderCUDA(
 					}
 				}
 			}
-			// any_sync 保证 如果有一个线程是 flag == true 的就将其规约到 0 号线程
-			if (__any_sync(0xffffffff, flag == true)) {
+
+			unsigned active = __activemask();
+			if (__any_sync(active, flag == true)) {
 				shuffle_dcolor_x = warpReduceSum<WARPSIZE>(shuffle_dcolor_x);
 				shuffle_dcolor_y = warpReduceSum<WARPSIZE>(shuffle_dcolor_y);
 				shuffle_dcolor_z = warpReduceSum<WARPSIZE>(shuffle_dcolor_z);
@@ -681,76 +667,45 @@ renderCUDA(
 
 				shuffle_dopacity = warpReduceSum<WARPSIZE>(shuffle_dopacity);
 
-				const int idx = j * 8 + warp_id;
-				// 所有的 warp 将 0 号线程 shuffle 得到的值, 加载到
 				if (lane_id == 0) {
 
-					collected_dL_dcolors[idx * C + 0] = shuffle_dcolor_x;
-					collected_dL_dcolors[idx * C + 1] = shuffle_dcolor_y;
-					collected_dL_dcolors[idx * C + 2] = shuffle_dcolor_z;
+					atomicAdd(&(dL_dcolors[collected_id[j] * C + 0]), shuffle_dcolor_x);
+					atomicAdd(&(dL_dcolors[collected_id[j] * C + 1]), shuffle_dcolor_y);
+					atomicAdd(&(dL_dcolors[collected_id[j] * C + 2]), shuffle_dcolor_z);
 
-					collected_dL_dmeans2D[idx].x = shuffle_dmean2D_x;
-					collected_dL_dmeans2D[idx].y = shuffle_dmean2D_y;
+					// Update gradients w.r.t. 2D mean position of the Gaussian
+					atomicAdd(&dL_dmean2D[collected_id[j]].x, shuffle_dmean2D_x);
+					atomicAdd(&dL_dmean2D[collected_id[j]].y, shuffle_dmean2D_y);
 
-					collected_dL_dconic2D[idx].x = shuffle_dconic2D_x;
-					collected_dL_dconic2D[idx].y = shuffle_dconic2D_y;
-					collected_dL_dconic2D[idx].w = shuffle_dconic2D_w;
-	
-					collected_dL_dopacity[idx] = shuffle_dopacity;
+					// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+					atomicAdd(&dL_dconic2D[collected_id[j]].x, shuffle_dconic2D_x);
+					atomicAdd(&dL_dconic2D[collected_id[j]].y, shuffle_dconic2D_y);
+					atomicAdd(&dL_dconic2D[collected_id[j]].w, shuffle_dconic2D_w);
+
+					// Update gradients w.r.t. opacity of the Gaussian
+					atomicAdd(&(dL_dopacity[collected_id[j]]), shuffle_dopacity);
+
+
+					// atomicAdd(&(collected_dL_dcolors[j * C + 0]), shuffle_dcolor_x);
+					// atomicAdd(&(collected_dL_dcolors[j * C + 1]), shuffle_dcolor_y);
+					// atomicAdd(&(collected_dL_dcolors[j * C + 2]), shuffle_dcolor_z);
+
+					// // Update gradients w.r.t. 2D mean position of the Gaussian
+					// atomicAdd(&colleted_dL_dmeans2D[j].x, shuffle_dmean2D_x);
+					// atomicAdd(&colleted_dL_dmeans2D[j].y, shuffle_dmean2D_y);
+
+					// // Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+					// atomicAdd(&collected_dL_dconic2D[j].x, shuffle_dconic2D_x);
+					// atomicAdd(&collected_dL_dconic2D[j].y, shuffle_dconic2D_y);
+					// atomicAdd(&collected_dL_dconic2D[j].w, shuffle_dconic2D_w);
+
+					// // Update gradients w.r.t. opacity of the Gaussian
+					// atomicAdd(&(collected_dL_dopacity[j]), shuffle_dopacity);
 				}
 			}
 		}
-
-		// shared 上同步 32 个高斯球的梯度已经完成了更新
-		block.sync();
-			
-		// 从 shared memory 中读数, 做累加
-		if (block.thread_rank() < min(32, inner_toDo)) {
-			// 之后优化做合并访存 float4
-			// 注意此处的 coll_id 是否准确 collected_id 存储着 256 个高斯球的 id, 现在的
-			// coll_id 需要重新处理一下
-			const int coll_id = collected_id[loops * 32 + block.thread_rank()];
-			float dL_dmean2D_x = 0.f;
-			float dL_dmean2D_y = 0.f;
-			float dL_dconic2D_x = 0.f;
-			float dL_dconic2D_y = 0.f;
-			float dL_dconic2D_w = 0.f;
-			float dL_dopacity_it = 0.f;
-			float dL_dcolors_r = 0.f;
-			float dL_dcolors_g = 0.f;
-			float dL_dcolors_b = 0.f;
-
-			// TODO 此处可以再做 float 访存
-			for (int index = 0; index < 8; index++) {
-				const int idx = block.thread_rank() * 8 + index;
-				dL_dmean2D_x += collected_dL_dmeans2D[idx].x;
-				dL_dmean2D_y += collected_dL_dmeans2D[idx].y;
-
-				dL_dconic2D_x += collected_dL_dconic2D[idx].x;
-				dL_dconic2D_y += collected_dL_dconic2D[idx].y;
-				dL_dconic2D_w += collected_dL_dconic2D[idx].w;
-				
-				dL_dopacity_it += collected_dL_dopacity[idx];
-
-				dL_dcolors_r += collected_dL_dcolors[idx * C + 0];
-				dL_dcolors_g += collected_dL_dcolors[idx * C + 1];
-				dL_dcolors_b += collected_dL_dcolors[idx * C + 2];
-			}
-
-			atomicAdd(&(dL_dmean2D[coll_id].x), dL_dmean2D_x);
-			atomicAdd(&(dL_dmean2D[coll_id].y), dL_dmean2D_y);
-			atomicAdd(&(dL_dopacity[coll_id]), dL_dopacity_it);
-			atomicAdd(&(dL_dconic2D[coll_id].x), dL_dconic2D_x);
-			atomicAdd(&(dL_dcolors[coll_id * C + 0]), dL_dcolors_r);
-			atomicAdd(&(dL_dconic2D[coll_id].y), dL_dconic2D_y);
-			atomicAdd(&(dL_dcolors[coll_id * C + 1]), dL_dcolors_g);
-			atomicAdd(&(dL_dconic2D[coll_id].w), dL_dconic2D_w);
-			atomicAdd(&(dL_dcolors[coll_id * C + 2]), dL_dcolors_b);
-		}
-		}
 	}
 }
-
 // template <uint32_t C>
 // __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 // renderCUDA(
