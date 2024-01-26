@@ -513,17 +513,6 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
-			for (int ch = 0; ch < C; ch++) {
-				collected_dL_dcolors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
-			}
-			
-			collected_dL_dconic2D[block.thread_rank()].x = 0.0f;
-			collected_dL_dconic2D[block.thread_rank()].y = 0.0f;
-			collected_dL_dconic2D[block.thread_rank()].w = 0.0f;
-			
-			colleted_dL_dmeans2D[block.thread_rank()] = float2{0.0f, 0.0f};
-
-			collected_dL_dopacity[block.thread_rank()] = 0.0f;
 		}
 		block.sync();
 
