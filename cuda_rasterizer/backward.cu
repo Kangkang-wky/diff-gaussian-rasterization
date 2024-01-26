@@ -473,11 +473,6 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 
-	__shared__ float collected_dL_dcolors[C * BLOCK_SIZE];
-	__shared__ float4 collected_dL_dconic2D[BLOCK_SIZE];
-	__shared__ float2 colleted_dL_dmeans2D[BLOCK_SIZE];
-	__shared__ float collected_dL_dopacity[BLOCK_SIZE];
-
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
 	const float T_final = inside ? final_Ts[pix_id] : 0;
@@ -592,7 +587,7 @@ renderCUDA(
 					con_o = collected_conic_opacity[j];
 					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 					if (power <= 0.0f) {
-						G = exp(power);
+						G = __expf(power);
 						alpha = min(0.99f, con_o.w * G);
 						if (alpha >= 1.0f / 255.0f) {
 							flag = true;
@@ -684,23 +679,6 @@ renderCUDA(
 
 					// Update gradients w.r.t. opacity of the Gaussian
 					atomicAdd(&(dL_dopacity[collected_id[j]]), shuffle_dopacity);
-
-
-					// atomicAdd(&(collected_dL_dcolors[j * C + 0]), shuffle_dcolor_x);
-					// atomicAdd(&(collected_dL_dcolors[j * C + 1]), shuffle_dcolor_y);
-					// atomicAdd(&(collected_dL_dcolors[j * C + 2]), shuffle_dcolor_z);
-
-					// // Update gradients w.r.t. 2D mean position of the Gaussian
-					// atomicAdd(&colleted_dL_dmeans2D[j].x, shuffle_dmean2D_x);
-					// atomicAdd(&colleted_dL_dmeans2D[j].y, shuffle_dmean2D_y);
-
-					// // Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-					// atomicAdd(&collected_dL_dconic2D[j].x, shuffle_dconic2D_x);
-					// atomicAdd(&collected_dL_dconic2D[j].y, shuffle_dconic2D_y);
-					// atomicAdd(&collected_dL_dconic2D[j].w, shuffle_dconic2D_w);
-
-					// // Update gradients w.r.t. opacity of the Gaussian
-					// atomicAdd(&(collected_dL_dopacity[j]), shuffle_dopacity);
 				}
 			}
 		}
