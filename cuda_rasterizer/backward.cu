@@ -455,7 +455,6 @@ renderCUDA(
 	auto block = cg::this_thread_block();
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float2 pixf = { (float)pix.x, (float)pix.y };
@@ -485,10 +484,13 @@ renderCUDA(
 
 	float accum_rec[C] = { 0.f };
 	float dL_dpixel[C];
-	if (inside)
-		for (int i = 0; i < C; i++)
+	if (inside) {
+		#pragma unroll 3
+		for (int i = 0; i < C; i++) {
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
-
+		}
+	}
+			
 	float last_alpha = 0.f;
 	float last_color[C] = { 0.f };
 
