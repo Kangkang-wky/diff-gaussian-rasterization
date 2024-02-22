@@ -578,7 +578,7 @@ renderCUDA(
 					con_o = collected_conic_opacity[j];
 					power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 					if (power <= 0.0f) {
-						G = __expf(power);
+						G = exp(power);
 						alpha = min(0.99f, con_o.w * G);
 						if (alpha >= 1.0f / 255.0f) {
 							flag = true;
