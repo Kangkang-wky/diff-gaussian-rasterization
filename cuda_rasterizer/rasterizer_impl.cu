@@ -88,7 +88,13 @@ __global__ void duplicateWithKeys(
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		// 返解出 half_height 以及 half_weight
+		// height 在前 weight 在后
+		int half_height = radii[idx] >> 16;
+		int half_weight = radii[idx] & 0xffff;  
+
+		getRect(points_xy[idx], half_height, half_weight, rect_min, rect_max, grid);
+		// getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,

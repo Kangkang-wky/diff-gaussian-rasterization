@@ -152,6 +152,9 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
+__constant__ float ALPHA_THRESHOLD = 1.0f / 255.0f;
+
+
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
@@ -224,19 +227,58 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
+	// 提前过滤 这一步数值精度稳定
+	if (opacities[idx] < 1.f / 255) {
+		return;
+	}
+
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
 	// rectangle covers 0 tiles. 
-	float mid = 0.5f * (cov.x + cov.z);
-	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
-	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	// float mid = 0.5f * (cov.x + cov.z);
+	// float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+	// float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	// float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
-	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	// getRect(point_image, my_radius, rect_min, rect_max, grid);
+	// if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+	// 	return;
+
+	// filter 提前计算, 将非高斯分布的点在混色阶段去掉一部分
+	// 在混色阶段之间提前过滤
+
+	float power_w = 2 * logf(opacities[idx] * 512.f) ;  // 置信区间
+
+	// 通过置信区间反解出椭圆方程中极值点, 极值点
+	// 采用椭圆方程求极值点, 求层次包围和
+
+	// 向上取整
+	int half_height = (int)((sqrtf(cov.z * power_w)) + 1.0f); 
+	int half_weight = (int)((sqrtf(cov.x * power_w)) + 1.0f);
+
+	// printf("%d %d\n", half_height, half_weight);
+
+	// height 在前 weight 在后
+	// height 在高16位  weight 在低16位
+	// int my_radius = (half_height << 16) | (half_weight & 0xffff);
+	
+	// int half_height = (int)my_radius; 
+	// int half_weight = (int)my_radius;
+	int circle_radius = ((int)half_height << 16) | ((int)half_weight & 0xffff);
+
+
+	// 不使用原来的层次包围盒, 使用新的层次包围和来包围
+	getRect(point_image, half_height, half_weight, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
+
+	
+	// printf("half_height = %d half_weight = %d circle_radius = %d rect_min.x = %d rect_max.x = %d rect_min.y = %d rect_max.y = %d rect_max.x - rect_min.x = %d rect_max.y - rect_min.y = %d\n", half_height, half_weight, circle_radius, rect_min.x, rect_max.x, rect_min.y, rect_max.y, rect_max.x - rect_min.x, rect_max.y - rect_min.y);
+	
+	// printf("idx = [%d] half_height = %d half_weight = %d circle_radius = %d rect_max.x = %d, rect_min.x = %d, rect_max.y = %d, rect_min.y = %d\n",
+	// 			idx, half_height, half_weight, circle_radius, rect_max.x, rect_min.x, rect_max.y, rect_min.y);
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
@@ -250,12 +292,50 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;
-	radii[idx] = my_radius;
+	radii[idx] = circle_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
+
+// 直接使用preprocess 中椭圆的层次包围盒是不行的
+// 因为训练的时候采用的高斯球覆盖估计 为 3.f · (sqrt(max(lambda1, lambda2)))
+// 这个会导致高斯球无法完成合理的覆盖
+// 通过反解方程方式来做似乎是更合适的
+
+// 通过以下公式把像素点给过滤掉, 试试
+// 函数参数需要 conic 以及  像素点坐标， 还有 高斯球 坐标 point_xy
+// 返回值为 该方块是否落在 高斯的内部
+
+// 先逐像素点判断, 再逐 warp 判断, 最后 block 判断是否落在高斯分布的内部
+// void __device__ test (float* point_image, float* pixel, float* conic, float* opacity) {
+// 	const float alpha_limit = 1.0f / 255.0f;
+	
+// 	// 取对数试试
+// 	const float power =  logf(alpha_limit / con_o.w);
+
+// 	dx = x - point.x;
+// 	dy = y - point.y;
+
+// 	// 实际上是要求 power < logf(上述值)
+
+// 	// -1/2 * (ox * dx * dx + oz * dy * dy) - (oy * dx * dy) = power;
+// 	// ox * dx * dx + oz * dy * dy + 2 * oy * dx * dy = - 2 * power
+	
+// 	// 判断符号 大于小于 比较方便
+// 	// 上述方程先判断
+
+
+// 	// 判断 x, dy 已知 对 dx  求值  反解 dx 意义是什么
+
+
+// 	// 判断 y, dx 已知 对 dy  求值
+
+
+
+// }
+
 
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
@@ -282,6 +362,13 @@ renderCUDA(
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	// uint thread_id = block.thread_rank();     (16, 2)
+	// uint warp_id = block.thread_rank() / 32;
+	// uint lane_id = block.thread_rank() % 32; 
+	// if (blockIdx.x == 0) {
+	// 	printf("%d %d %d %d %d\n", block.thread_index().x, block.thread_index().y, thread_id, warp_id, lane_id);
+	// }
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -320,6 +407,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			// 对冗余计算部分进行优化
 		}
 		block.sync();
 
