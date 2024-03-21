@@ -249,7 +249,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// filter 提前计算, 将非高斯分布的点在混色阶段去掉一部分
 	// 在混色阶段之间提前过滤
 
-	float power_w = 2 * logf(opacities[idx] * 256.f) ;  // 置信区间
+	float power_w = 2 * logf(opacities[idx] * 512.f) ;  // 置信区间
 
 	// 通过置信区间反解出椭圆方程中极值点, 极值点
 	// 采用椭圆方程求极值点, 求层次包围和
